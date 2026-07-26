@@ -1,0 +1,39 @@
+name = "random-choosers"
+main = "src/worker.js"
+compatibility_date = "2026-07-01"
+
+# Workers AI. Creation screens the name with @cf/openai/gpt-oss-20b and
+# generates the item list with @cf/openai/gpt-oss-120b (see src/worker.js).
+[ai]
+binding = "AI"
+remote = true
+
+# Create with:  npx wrangler kv namespace create CHOOSERS
+# then paste the returned id below.
+[[kv_namespaces]]
+binding = "CHOOSERS"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+remote = true
+
+# Strongly consistent press counters. Requires the Workers Paid plan.
+[[durable_objects.bindings]]
+name = "COUNTERS"
+class_name = "Counters"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Counters"]
+
+# Public Turnstile site key for the create form. The matching secret goes in
+# `wrangler secret put TURNSTILE_SECRET`. If the secret is unset the worker
+# skips verification entirely (documented dev/test bypass).
+[vars]
+TURNSTILE_SITE_KEY = "REPLACE_WITH_TURNSTILE_SITE_KEY"
+
+# Attach the domain after the zone is active in Cloudflare.
+[[routes]]
+pattern = "random.oddspark.dev"
+custom_domain = true
+
+[observability]
+enabled = true
