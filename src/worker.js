@@ -547,7 +547,7 @@ function createCardHtml(sitekey) {
     '<form id="create-form">' +
     '<input type="text" id="create-name" maxlength="60" required ' +
     'placeholder="random dinosaur" autocomplete="off">' +
-    '<div class="cf-turnstile" data-sitekey="' + esc(sitekey) + '"></div>' +
+    '<div class="cf-turnstile" data-sitekey="' + esc(sitekey) + '" data-theme="dark" data-size="flexible"></div>' +
     '<button class="strike" type="submit" id="create-btn">Create</button>' +
     "</form>" +
     '<div class="create-status" id="create-status"></div>' +
@@ -594,6 +594,11 @@ const CSS = `
   .grid{
     display:grid; gap:14px;
     grid-template-columns:repeat(auto-fill, minmax(280px, 1fr));
+  }
+  /* the Turnstile widget is ~300px wide and does not shrink below that;
+     give its card two tracks whenever the grid has room for them */
+  @media (min-width:640px){
+    .create-card{grid-column:span 2}
   }
 
   .card{
