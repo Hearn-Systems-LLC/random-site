@@ -12,7 +12,7 @@ remote = true
 # then paste the returned id below.
 [[kv_namespaces]]
 binding = "CHOOSERS"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "2f519d157b284c60a1ef9aa716a5c957"
 remote = true
 
 # Strongly consistent press counters. Requires the Workers Paid plan.
@@ -28,7 +28,7 @@ new_sqlite_classes = ["Counters"]
 # `wrangler secret put TURNSTILE_SECRET`. If the secret is unset the worker
 # skips verification entirely (documented dev/test bypass).
 [vars]
-TURNSTILE_SITE_KEY = "REPLACE_WITH_TURNSTILE_SITE_KEY"
+TURNSTILE_SITE_KEY = "0x4AAAAAAD93V9EKJ9q53pc6"
 
 # Attach the domain after the zone is active in Cloudflare.
 [[routes]]
