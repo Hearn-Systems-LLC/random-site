@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import worker, { BUILTINS, Counters, slugify, computePool } from "./src/worker.js";
+import worker, { BUILTINS, Counters, slugify, computePool, builtinPick, SHAPE_COLORS } from "./src/worker.js";
 
 /* ------------------------------------------------------------------ *
  * Mocks. No network, no wrangler: KV is a Map, the Counters DO is a
@@ -393,7 +393,7 @@ const rMetaTxt = await worker.fetch(req("/c/random", { headers: { accept: "text/
 const metaTxt = await rMetaTxt.text();
 check("/c/random text mode returns 200", rMetaTxt.status === 200, rMetaTxt.status);
 check("meta text names the chooser", metaTxt.includes("random random"), metaTxt.slice(0, 60));
-check("meta text offers no curl press", !metaTxt.includes("/api/pick/random"));
+check("meta text advertises its curl press", metaTxt.includes("/api/pick/random"));
 
 const rHomeTxt = await worker.fetch(req("/", { headers: { accept: "text/plain" } }), env, ctx);
 check("home text mode returns 200", rHomeTxt.status === 200, rHomeTxt.status);
@@ -569,13 +569,14 @@ const metaCurlTxt = await (await worker.fetch(req("/c/random", { headers: curlHd
 // "the pick happens in your browser" is true of every built-in but this one:
 // landing on a visitor-made chooser is a real press against its counter.
 check("meta text drops the browser-only claim", !metaCurlTxt.includes("the pick happens in your browser"));
-check("meta text says the browser picks the chooser", metaCurlTxt.includes("the chooser is picked in your browser"));
-check("meta text names the server hop", metaCurlTxt.includes("runs on the server"));
+check("meta text says a browser picks locally", metaCurlTxt.includes("the chooser is picked locally"));
+check("meta text names the server hop", metaCurlTxt.includes("runs that pick on the server"));
 check("meta text says it counts a press", metaCurlTxt.includes("counts as a press"));
 check("meta text keeps its blurb", metaCurlTxt.includes("picks a chooser, then picks something from it"));
 // Built-ins that really are browser-only must keep the plain wording.
 const numTxt = await (await worker.fetch(req("/c/number", { headers: curlHdr }), env, ctx)).text();
-check("ordinary built-in keeps browser-only wording", numTxt.includes("built-in; the pick happens in your browser."));
+check("ordinary built-in says it has no counter", numTxt.includes("built-in; no press counter"));
+check("ordinary built-in advertises its curl press", numTxt.includes("curl -X POST") && numTxt.includes("/api/pick/number"));
 check("ordinary built-in gains no server caveat", !numTxt.includes("runs on the server"));
 // User choosers keep their curl instructions and gain no built-in wording.
 const userTxt = await (await worker.fetch(req("/c/random-dinosaur", { headers: curlHdr }), env, ctx)).text();
@@ -619,6 +620,105 @@ check("JSON-LD carries the image", ogHtml.includes('"image":"https://random.odds
 const socialPermHtml = await (await worker.fetch(req("/c/random", { headers: { accept: "text/html" } }), env, ctx)).text();
 check("permalink also carries og:image", socialPermHtml.includes('property="og:image" content="https://random.oddspark.dev/social.png"'));
 check("permalink also gets the large card", socialPermHtml.includes('content="summary_large_image"'));
+
+/* 21. built-ins and the meta chooser are pressable over the API ------- */
+const B = (s) => BUILTINS.find((b) => b.slug === s);
+const post = (s) => worker.fetch(req("/api/pick/" + s, { method: "POST" }), env, ctx);
+
+// builtinPick is pure, so hammer it for range invariants rather than exact
+// values. Bounds are where an off-by-one hides.
+const nums = Array.from({ length: 400 }, () => Number(builtinPick(B("number"))));
+check("number is always an integer", nums.every((n) => Number.isInteger(n)));
+check("number never below 1", Math.min(...nums) >= 1, Math.min(...nums));
+check("number never above 100", Math.max(...nums) <= 100, Math.max(...nums));
+check("number reaches both bounds over 400 draws", nums.includes(1) && nums.includes(100));
+
+const cols = Array.from({ length: 200 }, () => builtinPick(B("color")));
+check("color is a 6-digit lowercase hex", cols.every((c) => /^#[0-9a-f]{6}$/.test(c)), cols[0]);
+check("color varies", new Set(cols).size > 100, new Set(cols).size);
+
+// shape: "a 7-sided polygon in #C9A227, filled". pressShape draws randInt(3,9)
+// vertices, so the description must cover exactly that range and no wider.
+const shapes = Array.from({ length: 600 }, () => builtinPick(B("shape")));
+const shapeRe = /^an? (\d+)-sided polygon in (#[0-9A-F]{6}), (filled|outlined)$/;
+check("shape description parses", shapes.every((s) => shapeRe.test(s)), shapes[0]);
+const sides = shapes.map((s) => Number(s.match(shapeRe)[1]));
+check("shape has at least 3 sides", Math.min(...sides) === 3, Math.min(...sides));
+check("shape has at most 9 sides", Math.max(...sides) === 9, Math.max(...sides));
+check(
+  "shape only uses the shared palette",
+  shapes.every((s) => SHAPE_COLORS.includes(s.match(shapeRe)[2])),
+  [...new Set(shapes.map((s) => s.match(shapeRe)[2]))].filter((c) => !SHAPE_COLORS.includes(c)).join(",")
+);
+// English article agreement: only 8 takes "an", since it follows the spoken digit.
+check(
+  "shape article agrees with the digit",
+  shapes.every((s) => (Number(s.match(shapeRe)[1]) === 8 ? s.startsWith("an ") : s.startsWith("a "))),
+  shapes.find((s) => (Number(s.match(shapeRe)[1]) === 8 ? !s.startsWith("an ") : !s.startsWith("a "))) || "ok"
+);
+check("shape is sometimes filled and sometimes outlined",
+  shapes.some((s) => s.endsWith("filled")) && shapes.some((s) => s.endsWith("outlined")));
+
+const listPick = Array.from({ length: 100 }, () => builtinPick(B("animal")));
+check("animal picks come from the list", listPick.every((a) => B("animal").items.includes(a)), listPick[0]);
+
+// Over the API.
+const rNum = await post("number");
+const jNum = await rNum.json();
+check("POST /api/pick/number returns 200", rNum.status === 200, rNum.status);
+check("number pick has no counter", !("count" in jNum), JSON.stringify(jNum));
+check("number pick echoes slug and name", jNum.slug === "number" && jNum.name === "number");
+check("POST /api/pick/animal returns a list member", B("animal").items.includes((await (await post("animal")).json()).item));
+
+// The meta chooser delegates and reports what it landed on.
+const rMetaPick = await post("random");
+const jMetaPick = await rMetaPick.json();
+check("POST /api/pick/random returns 200", rMetaPick.status === 200, rMetaPick.status);
+check("meta pick reports its own slug", jMetaPick.slug === "random", jMetaPick.slug);
+check("meta pick names what it delegated to", !!(jMetaPick.via && jMetaPick.via.slug && jMetaPick.via.name), JSON.stringify(jMetaPick.via));
+check("meta pick returns a non-empty item", typeof jMetaPick.item === "string" && jMetaPick.item.length > 0, jMetaPick.item);
+
+// Never itself -- the recursion guard. computePool excludes type "meta", and
+// this is the assertion that would catch it if that ever regressed.
+const vias = [];
+for (let i = 0; i < 60; i++) vias.push((await (await post("random")).json()).via.slug);
+check("meta never delegates to itself over 60 presses", !vias.includes("random"), [...new Set(vias)].join(","));
+check("meta reaches both built-ins and user choosers",
+  vias.some((v) => BUILTINS.some((b) => b.slug === v)) && vias.some((v) => !BUILTINS.some((b) => b.slug === v)),
+  [...new Set(vias)].join(","));
+
+// Landing on a visitor-made chooser is a real press, exactly as in the browser.
+let userLanding = null;
+for (let i = 0; i < 80 && !userLanding; i++) {
+  const j = await (await post("random")).json();
+  if (!BUILTINS.some((b) => b.slug === j.via.slug)) userLanding = j;
+}
+check("meta eventually lands on a user chooser", !!userLanding);
+if (userLanding) {
+  check("indirect press returns that chooser's count", typeof userLanding.count === "number", userLanding.count);
+  const direct = await (await post(userLanding.via.slug)).json();
+  check("indirect press counted on the target, not the meta chooser",
+    direct.count > userLanding.count, userLanding.count + " -> " + direct.count);
+}
+// Delegating to a built-in must not quietly invent a counter for it.
+let builtinLanding = null;
+for (let i = 0; i < 80 && !builtinLanding; i++) {
+  const j = await (await post("random")).json();
+  if (BUILTINS.some((b) => b.slug === j.via.slug)) builtinLanding = j;
+}
+check("meta eventually lands on a built-in", !!builtinLanding);
+if (builtinLanding) {
+  check("built-in delegation creates no counter", !("count" in builtinLanding), JSON.stringify(builtinLanding));
+}
+check("unknown slug still 404s", (await post("no-such-chooser-anywhere")).status === 404);
+
+// The palette now has one definition, injected into the client the same way
+// LISTS and CHOOSERS are.
+const shapeHtml = await (await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx)).text();
+check("no __SHAPE_COLORS__ placeholder left", !shapeHtml.includes("__SHAPE_COLORS__"));
+check("palette inlined for the client", shapeHtml.includes(JSON.stringify(SHAPE_COLORS)), SHAPE_COLORS.join(","));
+check("palette is not duplicated in the client script",
+  (shapeHtml.match(/#8FA876/g) || []).length === 1, (shapeHtml.match(/#8FA876/g) || []).length);
 
 /* report -------------------------------------------------------------- */
 let fails = 0;

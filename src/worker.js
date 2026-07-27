@@ -97,6 +97,11 @@ function manifestEntry(c) {
   return { slug: c.slug, name: c.name, kind: c.kind, type: c.type };
 }
 
+/* Shared by the canvas the browser draws and the sentence the server
+   returns to curl, so the two never drift. Injected into the client
+   script via __SHAPE_COLORS__ the same way LISTS and CHOOSERS are. */
+export const SHAPE_COLORS = ["#6E8FB8", "#C9A227", "#E06A3F", "#5E8CA8", "#8FA876", "#B87E9E"];
+
 function buildManifest(users) {
   return BUILTINS.map(manifestEntry).concat(users.map(manifestEntry));
 }
@@ -486,7 +491,7 @@ function homeAsText(builtins, users, counts) {
   L.push("  random choosers");
   L.push("  a shelf of buttons that pick things");
   L.push("");
-  L.push("  BUILT-IN (these run in your browser)");
+  L.push("  BUILT-IN (richer in a browser: a swatch, a drawn polygon)");
   for (const b of builtins) L.push("    " + b.slug.padEnd(22) + b.blurb);
   L.push("");
   L.push("  MADE BY VISITORS");
@@ -517,13 +522,17 @@ function chooserAsText(c, origin) {
     // The one built-in that can reach the server. Saying "the pick happens
     // in your browser" here would be a half-truth: landing on a visitor-made
     // chooser is a real press against that chooser's counter.
-    L.push("  built-in; the chooser is picked in your browser. if it lands");
-    L.push("  on a visitor-made chooser, that pick runs on the server and");
-    L.push("  counts as a press for it.");
+    L.push("  built-in. in a browser the chooser is picked locally; landing");
+    L.push("  on a visitor-made chooser runs that pick on the server and");
+    L.push("  counts as a press for it. pressing it here delegates the same");
+    L.push("  way, over the whole shelf.");
     L.push("  " + c.blurb);
+    L.push("  press it:  curl -X POST " + origin + "/api/pick/" + c.slug);
   } else if (c.kind === "builtin") {
-    L.push("  built-in; the pick happens in your browser.");
+    L.push("  built-in; no press counter. a browser renders it richer than");
+    L.push("  a terminal can -- color is a swatch, shape a drawn polygon.");
     L.push("  " + c.blurb);
+    L.push("  press it:  curl -X POST " + origin + "/api/pick/" + c.slug);
   } else {
     L.push("  " + c.items.length + " items on the list, refreshed daily.");
     L.push("  press it:  curl -X POST " + origin + "/api/pick/" + c.slug);
@@ -853,7 +862,7 @@ const CLIENT_SCRIPT = `
   var LISTS = __LISTS__;
   var CHOOSERS = __CHOOSERS__;
   __POOL_FN__
-  var SHAPE_COLORS = ["#6E8FB8", "#C9A227", "#E06A3F", "#5E8CA8", "#8FA876", "#B87E9E"];
+  var SHAPE_COLORS = __SHAPE_COLORS__;
 
   console.log(
     "%c random choosers %c press a card, get a thing ",
@@ -1317,7 +1326,8 @@ function page(opts) {
 <script>${CLIENT_SCRIPT
   .replace("__LISTS__", function () { return listsJson; })
   .replace("__CHOOSERS__", function () { return scriptJson(opts.choosers || []); })
-  .replace("__POOL_FN__", function () { return computePool.toString(); })}</script>
+  .replace("__POOL_FN__", function () { return computePool.toString(); })
+  .replace("__SHAPE_COLORS__", function () { return scriptJson(SHAPE_COLORS); })}</script>
 </body>
 </html>`;
 }
@@ -1450,14 +1460,72 @@ async function handleCreate(request, env) {
   return json({ slug, name });
 }
 
-async function handlePick(request, env, ctx, slug) {
-  const rec = await getUserChooser(env, slug);
-  if (!rec) {
-    if (BUILTIN_MAP[slug]) {
-      return json({ error: "built-in choosers run in the browser; no server pick" }, 400);
-    }
-    return json({ error: "no chooser with that slug" }, 404);
+/* ------------------------------------------------------------------ *
+ * Server-side picks for the built-ins.
+ *
+ * The browser renders some of these richer than text allows -- color is a
+ * swatch, shape is a canvas -- so these are the terminal forms. shape is
+ * the only one with no natural text form: rather than drop it from the
+ * pool (which would give curl different odds than the site advertises
+ * under the same name), it describes the polygon it would have drawn,
+ * using exactly the parameters pressShape uses.
+ * ------------------------------------------------------------------ */
+
+export function builtinPick(c) {
+  if (c.type === "number") return String(1 + randomIndex(100));
+  if (c.type === "color") {
+    let hex = "#";
+    for (let i = 0; i < 6; i++) hex += "0123456789abcdef"[randomIndex(16)];
+    return hex;
   }
+  if (c.type === "shape") {
+    const sides = 3 + randomIndex(7); // pressShape: randInt(3, 9)
+    const color = SHAPE_COLORS[randomIndex(SHAPE_COLORS.length)];
+    const filled = randomIndex(2) === 0; // pressShape: rand() < 0.5
+    // "an 8-sided polygon" -- eight is the only vertex count in 3..9 that
+    // takes "an", since the article follows the spoken digit.
+    const article = sides === 8 ? "an " : "a ";
+    return article + sides + "-sided polygon in " + color + (filled ? ", filled" : ", outlined");
+  }
+  if (c.type === "list" && c.items && c.items.length) {
+    return c.items[randomIndex(c.items.length)];
+  }
+  return null;
+}
+
+async function handlePick(request, env, ctx, slug) {
+  const builtin = BUILTIN_MAP[slug];
+
+  // The meta chooser delegates. Its pool is per-visitor in the browser, but
+  // curl carries no preferences, so the server uses the default: everything
+  // except itself. computePool is the same function the browser runs, so the
+  // two agree on what "everything" means -- including excluding the meta
+  // chooser, which is what stops this from recursing.
+  if (builtin && builtin.type === "meta") {
+    const pool = computePool(buildManifest(await listUserChoosers(env)));
+    if (!pool.length) return json({ error: "nothing to choose from" }, 503);
+    const chosen = pool[randomIndex(pool.length)];
+    const via = { slug: chosen.slug, name: chosen.name };
+    if (chosen.kind === "builtin") {
+      return json({ slug, name: builtin.name, via, item: builtinPick(BUILTIN_MAP[chosen.slug]) });
+    }
+    // Landing on a visitor-made chooser is a real press against its counter,
+    // exactly as it is in the browser.
+    const target = await getUserChooser(env, chosen.slug);
+    if (!target) return json({ error: "no pick: chooser vanished mid-press" }, 404);
+    const item = target.items[randomIndex(target.items.length)];
+    const count = await hitCounter(env, chosen.slug);
+    if (target.listDay !== utcDay() && ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(refreshList(env, chosen.slug, target.name));
+    }
+    return json({ slug, name: builtin.name, via, item, count });
+  }
+
+  // Built-ins have no counters, so no hitCounter call and no count field.
+  if (builtin) return json({ slug, name: builtin.name, item: builtinPick(builtin) });
+
+  const rec = await getUserChooser(env, slug);
+  if (!rec) return json({ error: "no chooser with that slug" }, 404);
   const item = rec.items[randomIndex(rec.items.length)];
   const count = await hitCounter(env, slug);
 
