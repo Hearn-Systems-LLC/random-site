@@ -513,7 +513,15 @@ function chooserAsText(c, origin) {
   L.push("  " + c.name);
   L.push("  a random chooser");
   L.push("");
-  if (c.kind === "builtin") {
+  if (c.type === "meta") {
+    // The one built-in that can reach the server. Saying "the pick happens
+    // in your browser" here would be a half-truth: landing on a visitor-made
+    // chooser is a real press against that chooser's counter.
+    L.push("  built-in; the chooser is picked in your browser. if it lands");
+    L.push("  on a visitor-made chooser, that pick runs on the server and");
+    L.push("  counts as a press for it.");
+    L.push("  " + c.blurb);
+  } else if (c.kind === "builtin") {
     L.push("  built-in; the pick happens in your browser.");
     L.push("  " + c.blurb);
   } else {

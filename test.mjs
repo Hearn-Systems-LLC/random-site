@@ -562,6 +562,25 @@ check("counterless card does not throw", noCountOk === true, noCountOk);
 setCount("absent-from-page", 7);
 check("slug absent from page is a no-op", stubCards[1].count.textContent === "4 presses", stubCards[1].count.textContent);
 
+/* 19. text output tells the truth about where the meta pick runs ------ */
+const curlHdr = { "user-agent": "curl/8.4.0", accept: "*/*" };
+const metaCurlTxt = await (await worker.fetch(req("/c/random", { headers: curlHdr }), env, ctx)).text();
+// "the pick happens in your browser" is true of every built-in but this one:
+// landing on a visitor-made chooser is a real press against its counter.
+check("meta text drops the browser-only claim", !metaCurlTxt.includes("the pick happens in your browser"));
+check("meta text says the browser picks the chooser", metaCurlTxt.includes("the chooser is picked in your browser"));
+check("meta text names the server hop", metaCurlTxt.includes("runs on the server"));
+check("meta text says it counts a press", metaCurlTxt.includes("counts as a press"));
+check("meta text keeps its blurb", metaCurlTxt.includes("picks a chooser, then picks something from it"));
+// Built-ins that really are browser-only must keep the plain wording.
+const numTxt = await (await worker.fetch(req("/c/number", { headers: curlHdr }), env, ctx)).text();
+check("ordinary built-in keeps browser-only wording", numTxt.includes("built-in; the pick happens in your browser."));
+check("ordinary built-in gains no server caveat", !numTxt.includes("runs on the server"));
+// User choosers keep their curl instructions and gain no built-in wording.
+const userTxt = await (await worker.fetch(req("/c/random-dinosaur", { headers: curlHdr }), env, ctx)).text();
+check("user chooser keeps its curl line", userTxt.includes("curl -X POST"));
+check("user chooser is not labelled built-in", !userTxt.includes("built-in;"));
+
 /* report -------------------------------------------------------------- */
 let fails = 0;
 for (const r of results) {
