@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import worker, { BUILTINS, Counters, slugify, computePool } from "./src/worker.js";
 
 /* ------------------------------------------------------------------ *
@@ -580,6 +581,44 @@ check("ordinary built-in gains no server caveat", !numTxt.includes("runs on the 
 const userTxt = await (await worker.fetch(req("/c/random-dinosaur", { headers: curlHdr }), env, ctx)).text();
 check("user chooser keeps its curl line", userTxt.includes("curl -X POST"));
 check("user chooser is not labelled built-in", !userTxt.includes("built-in;"));
+
+/* 20. social preview image and card metadata -------------------------- */
+const rPng = await worker.fetch(req("/social.png"), env, ctx);
+check("/social.png returns 200", rPng.status === 200, rPng.status);
+check("/social.png is image/png", (rPng.headers.get("content-type") || "") === "image/png", rPng.headers.get("content-type"));
+check("/social.png is cached hard", (rPng.headers.get("cache-control") || "").includes("immutable"));
+const png = new Uint8Array(await rPng.arrayBuffer());
+// Verify real decoded bytes, not just that a route answers: PNG magic number
+// then the IHDR width/height, which are big-endian uint32 at offsets 16 and 20.
+check("PNG magic number intact", [137, 80, 78, 71, 13, 10, 26, 10].every((b, i) => png[i] === b), png.slice(0, 8).join(","));
+const dv = new DataView(png.buffer, png.byteOffset, png.byteLength);
+check("PNG is 1280 wide", dv.getUint32(16) === 1280, dv.getUint32(16));
+check("PNG is 640 tall", dv.getUint32(20) === 640, dv.getUint32(20));
+// GitHub rejects social previews over 1MB, and og: scrapers commonly cap at 5MB.
+check("PNG is comfortably under 1MB", png.length < 1024 * 1024, png.length);
+// The header checks above all live in the first 24 bytes, so they pass happily
+// on a truncated image. This is the assertion that actually bites: what the
+// worker serves must equal what is committed, catching truncation, corruption,
+// and drift between assets/social.png and the inlined base64.
+const sourcePng = new Uint8Array(readFileSync("assets/social.png"));
+check(
+  "served bytes match assets/social.png exactly",
+  png.length === sourcePng.length && png.every((b, i) => b === sourcePng[i]),
+  png.length + " served vs " + sourcePng.length + " on disk"
+);
+
+const ogHtml = await (await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx)).text();
+check("og:image points at the absolute production URL", ogHtml.includes('property="og:image" content="https://random.oddspark.dev/social.png"'));
+check("og:image declares its dimensions", ogHtml.includes('og:image:width" content="1280"') && ogHtml.includes('og:image:height" content="640"'));
+check("og:image carries alt text", ogHtml.includes('property="og:image:alt"'));
+check("twitter card upgraded to large image", ogHtml.includes('name="twitter:card" content="summary_large_image"'));
+check("twitter:image set", ogHtml.includes('name="twitter:image" content="https://random.oddspark.dev/social.png"'));
+check("no leftover summary-only card", !ogHtml.includes('content="summary"'));
+check("JSON-LD carries the image", ogHtml.includes('"image":"https://random.oddspark.dev/social.png"'));
+// Permalinks are shared far more than the root, so they need the card too.
+const socialPermHtml = await (await worker.fetch(req("/c/random", { headers: { accept: "text/html" } }), env, ctx)).text();
+check("permalink also carries og:image", socialPermHtml.includes('property="og:image" content="https://random.oddspark.dev/social.png"'));
+check("permalink also gets the large card", socialPermHtml.includes('content="summary_large_image"'));
 
 /* report -------------------------------------------------------------- */
 let fails = 0;
