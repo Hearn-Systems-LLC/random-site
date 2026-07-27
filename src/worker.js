@@ -914,7 +914,8 @@ const CLIENT_SCRIPT = `
   /* user chooser: server pick -------------------------------------- */
   function pressKv(card, slug, btn){
     btn.disabled = true;
-    fetch("/api/pick/" + encodeURIComponent(slug), { method: "POST" })
+    var ok = true;
+    return fetch("/api/pick/" + encodeURIComponent(slug), { method: "POST" })
       .then(function(res){
         return res.json().then(function(j){ return { ok: res.ok, j: j }; });
       })
@@ -927,10 +928,14 @@ const CLIENT_SCRIPT = `
         }
       })
       .catch(function(e){
+        ok = false;
         showErr(card, "no pick: " + e.message);
       })
       .finally(function(){
         btn.disabled = false;
+      })
+      .then(function(){
+        return ok;
       });
   }
 
@@ -970,6 +975,7 @@ const CLIENT_SCRIPT = `
     var listEl = card.querySelector(".pool-list");
     var viaEl = card.querySelector(".via");
     var btn = card.querySelector("button.press");
+    var pending = false;
 
     for (var i = 0; i < CHOOSERS.length; i++) {
       var c = CHOOSERS[i];
@@ -989,7 +995,7 @@ const CLIENT_SCRIPT = `
 
     function refresh(){
       var pool = computePool(CHOOSERS, state);
-      btn.disabled = pool.length === 0;
+      btn.disabled = pending || pool.length === 0;
       if (pool.length === 0) viaEl.textContent = "nothing selected";
       else if (viaEl.textContent === "nothing selected") viaEl.textContent = "";
     }
@@ -1017,14 +1023,20 @@ const CLIENT_SCRIPT = `
       var pool = computePool(CHOOSERS, state);
       if (!pool.length) return;
       var chosen = pick(pool);
-      viaEl.textContent = "via " + chosen.name;
       if (chosen.kind === "builtin") {
+        viaEl.textContent = "via " + chosen.name;
         if (chosen.type === "number") pressNumber(card);
         else if (chosen.type === "color") pressColor(card);
         else if (chosen.type === "shape") pressShape(card);
         else pressList(card, chosen.slug);
       } else {
-        pressKv(card, chosen.slug, btn);
+        pending = true;
+        refresh();
+        pressKv(card, chosen.slug, btn).then(function(ok){
+          viaEl.textContent = ok ? "via " + chosen.name : "";
+          pending = false;
+          refresh();
+        });
       }
     });
   }
