@@ -7,8 +7,9 @@ Cloudflare Worker, no build step. Same conventions as
 
 ## Built-in choosers
 
-Five choosers ship in the worker and run entirely in the browser — no server
-calls, no counters:
+Six choosers ship in the worker. Five run entirely in the browser — no server
+calls, no counters; the sixth, `random`, calls the server when it lands on a
+user chooser:
 
 | slug | what it does |
 |---|---|
@@ -17,9 +18,24 @@ calls, no counters:
 | `shape` | random polygon/blob on a small canvas (3–9 vertices, radius jitter, stroke or fill, fixed palette) |
 | `animal` | picks from a hardcoded 72-item animal list |
 | `simpsons-character` | picks from a hardcoded 64-item Simpsons list |
+| `random` | picks one of the other choosers, then a result from it; pool configurable per visitor |
 
 They are defined as a data table in `src/worker.js` (`BUILTINS`), so the
 homepage grid and the `/c/:slug` permalinks render them identically.
+
+The sixth built-in, `random`, is a meta chooser: it picks one of the others and
+delegates, so the result renders in whatever form that chooser produces — a
+swatch, a canvas, or a server pick. Which choosers it may land on is set per
+visitor with two group toggles plus a per-chooser `customize` list, stored in
+`localStorage` under `rc_pool`.
+
+Preferences are stored as *exclusions* (`{builtins, users, off: [slug]}`), not
+inclusions, so choosers created after a visitor sets preferences are in the pool
+by default rather than silently absent.
+
+Landing on a user chooser calls the same `POST /api/pick/:slug` as a direct
+press, so indirect presses count. `random` itself has no press counter, matching
+the other built-ins.
 
 ## User-created choosers
 

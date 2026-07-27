@@ -59,9 +59,45 @@ export const BUILTINS = [
   { slug: "shape", name: "shape", kind: "builtin", type: "shape", blurb: "a little polygon, drawn fresh each press" },
   { slug: "animal", name: "animal", kind: "builtin", type: "list", items: ANIMALS, blurb: "one of " + ANIMALS.length + " animals" },
   { slug: "simpsons-character", name: "simpsons character", kind: "builtin", type: "list", items: SIMPSONS, blurb: "one of " + SIMPSONS.length + " springfielders" },
+  { slug: "random", name: "random random", kind: "builtin", type: "meta", blurb: "picks a chooser, then picks something from it" },
 ];
 
 const BUILTIN_MAP = Object.fromEntries(BUILTINS.map((b) => [b.slug, b]));
+
+/* ------------------------------------------------------------------ *
+ * computePool: which choosers is the "random random" card allowed to
+ * land on, given the visitor's saved preferences?
+ *
+ * Written in the client script's dialect (var / function, no const or
+ * arrows) and deliberately self-contained -- no module-scope reads --
+ * because its SOURCE TEXT is injected into the browser via
+ * .toString(). A reference to anything outside this function body
+ * would work in Node and throw ReferenceError in the browser. That is
+ * also why "random" is hardcoded here rather than shared as a const.
+ * ------------------------------------------------------------------ */
+export function computePool(manifest, state) {
+  var wantBuiltins = !state || state.builtins !== false;
+  var wantUsers = !state || state.users !== false;
+  var off = (state && state.off) || [];
+  var out = [];
+  for (var i = 0; i < manifest.length; i++) {
+    var c = manifest[i];
+    if (c.slug === "random" || c.type === "meta") continue;
+    if (c.kind === "builtin" ? !wantBuiltins : !wantUsers) continue;
+    if (off.indexOf(c.slug) !== -1) continue;
+    out.push(c);
+  }
+  return out;
+}
+
+/* The shape the client needs to reason about a chooser. */
+function manifestEntry(c) {
+  return { slug: c.slug, name: c.name, kind: c.kind, type: c.type };
+}
+
+function buildManifest(users) {
+  return BUILTINS.map(manifestEntry).concat(users.map(manifestEntry));
+}
 
 /* ------------------------------------------------------------------ *
  * Crypto helpers
@@ -516,6 +552,16 @@ function cardHtml(c, count) {
       '<label>min <input type="number" class="num-min" value="1" step="1"></label>' +
       '<label>max <input type="number" class="num-max" value="100" step="1"></label>' +
       "</div>";
+  } else if (c.type === "meta") {
+    // The per-chooser list is filled in by the client from the inlined
+    // manifest; cardHtml only ever sees one chooser, not the shelf.
+    controls =
+      '<div class="ctl ctl-pool">' +
+      '<label class="grp"><input type="checkbox" class="pool-builtins" checked> built-ins</label>' +
+      '<label class="grp"><input type="checkbox" class="pool-users" checked> user-made</label>' +
+      "</div>" +
+      '<details class="pool-more"><summary>customize</summary>' +
+      '<div class="pool-list"></div></details>';
   }
   let meta = "";
   if (c.kind !== "builtin") {
@@ -524,6 +570,7 @@ function cardHtml(c, count) {
       (typeof count === "number" ? count + (count === 1 ? " press" : " presses") : "") +
       "</div>";
   }
+  const via = c.type === "meta" ? '<div class="via" aria-live="polite"></div>' : "";
   return (
     '<article class="card" data-slug="' + esc(c.slug) + '" data-kind="' + esc(c.kind) + '"' +
     (c.type ? ' data-type="' + esc(c.type) + '"' : "") +
@@ -531,6 +578,7 @@ function cardHtml(c, count) {
     "<h2>" + esc(c.name) + perm + "</h2>" +
     '<div class="blurb">' + esc(c.blurb || "a generated list, refreshed daily") + "</div>" +
     controls +
+    via +
     '<div class="result" aria-live="polite"><span class="hint">&mdash; press &mdash;</span></div>' +
     '<button class="strike press" type="button">Press</button>' +
     meta +
@@ -624,6 +672,31 @@ const CSS = `
   }
   .ctl input:focus{outline:1px solid var(--entropy)}
 
+  .ctl-pool{flex-wrap:wrap}
+  .ctl-pool .grp{
+    display:flex; align-items:center; gap:5px; cursor:pointer;
+    font-size:12px; color:var(--dim);
+  }
+  .pool-more{margin-top:8px}
+  .pool-more summary{
+    color:var(--faint); font-size:10.5px; letter-spacing:.12em;
+    text-transform:uppercase; cursor:pointer;
+  }
+  .pool-list{
+    max-height:132px; overflow-y:auto; margin-top:6px;
+    display:flex; flex-direction:column; gap:4px;
+  }
+  .pool-list label{
+    display:flex; align-items:center; gap:6px;
+    font-size:12px; color:var(--dim); cursor:pointer;
+    word-break:break-word;
+  }
+  .via{
+    color:var(--faint); font-size:10.5px; letter-spacing:.12em;
+    text-transform:uppercase; min-height:14px;
+    word-break:break-word;
+  }
+
   .result{
     min-height:64px; display:flex; align-items:center; justify-content:center;
     border:1px dashed var(--rule); padding:10px; text-align:center;
@@ -691,6 +764,8 @@ const CLIENT_SCRIPT = `
   var HEX = "0123456789abcdef";
   var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var LISTS = __LISTS__;
+  var CHOOSERS = __CHOOSERS__;
+  __POOL_FN__
   var SHAPE_COLORS = ["#6E8FB8", "#C9A227", "#E06A3F", "#5E8CA8", "#8FA876", "#B87E9E"];
 
   console.log(
@@ -758,6 +833,9 @@ const CLIENT_SCRIPT = `
     var maxIn = card.querySelector(".num-max");
     var CAP = 1e12;
     function clamped(input, fallback){
+      // The meta card borrows this function but has no bounds inputs,
+      // so an absent input means "use the default".
+      if (!input) return fallback;
       var v = parseFloat(input.value);
       if (!isFinite(v)) v = fallback;
       v = Math.round(v);
@@ -767,7 +845,11 @@ const CLIENT_SCRIPT = `
       return v;
     }
     var a = clamped(minIn, 1), b = clamped(maxIn, 100);
-    if (a > b) { var t = a; a = b; b = t; minIn.value = a; maxIn.value = b; }
+    if (a > b) {
+      var t = a; a = b; b = t;
+      if (minIn) minIn.value = a;
+      if (maxIn) maxIn.value = b;
+    }
     textResult(card, String(randInt(a, b)), true);
   }
 
@@ -834,7 +916,8 @@ const CLIENT_SCRIPT = `
   /* user chooser: server pick -------------------------------------- */
   function pressKv(card, slug, btn){
     btn.disabled = true;
-    fetch("/api/pick/" + encodeURIComponent(slug), { method: "POST" })
+    var ok = true;
+    return fetch("/api/pick/" + encodeURIComponent(slug), { method: "POST" })
       .then(function(res){
         return res.json().then(function(j){ return { ok: res.ok, j: j }; });
       })
@@ -847,11 +930,117 @@ const CLIENT_SCRIPT = `
         }
       })
       .catch(function(e){
+        ok = false;
         showErr(card, "no pick: " + e.message);
       })
       .finally(function(){
         btn.disabled = false;
+      })
+      .then(function(){
+        return ok;
       });
+  }
+
+  /* meta chooser: pool preferences --------------------------------- */
+  var POOL_KEY = "rc_pool";
+
+  function defaultPool(){ return { builtins: true, users: true, off: [] }; }
+
+  function loadPool(){
+    try {
+      var raw = localStorage.getItem(POOL_KEY);
+      if (!raw) return defaultPool();
+      var s = JSON.parse(raw);
+      if (!s || typeof s !== "object") return defaultPool();
+      var known = {};
+      for (var i = 0; i < CHOOSERS.length; i++) known[CHOOSERS[i].slug] = 1;
+      var off = [];
+      if (Object.prototype.toString.call(s.off) === "[object Array]") {
+        for (var k = 0; k < s.off.length; k++) {
+          if (known[s.off[k]]) off.push(s.off[k]);
+        }
+      }
+      return { builtins: s.builtins !== false, users: s.users !== false, off: off };
+    } catch (e) {
+      return defaultPool();
+    }
+  }
+
+  function savePool(state){
+    try { localStorage.setItem(POOL_KEY, JSON.stringify(state)); } catch (e) {}
+  }
+
+  function bindMeta(card){
+    var state = loadPool();
+    var bEl = card.querySelector(".pool-builtins");
+    var uEl = card.querySelector(".pool-users");
+    var listEl = card.querySelector(".pool-list");
+    var viaEl = card.querySelector(".via");
+    var btn = card.querySelector("button.press");
+    var pending = false;
+
+    for (var i = 0; i < CHOOSERS.length; i++) {
+      var c = CHOOSERS[i];
+      if (c.slug === "random") continue;
+      var lab = document.createElement("label");
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.setAttribute("data-slug", c.slug);
+      box.checked = state.off.indexOf(c.slug) === -1;
+      lab.appendChild(box);
+      lab.appendChild(document.createTextNode(" " + c.name));
+      listEl.appendChild(lab);
+    }
+
+    bEl.checked = state.builtins;
+    uEl.checked = state.users;
+
+    function refresh(){
+      var pool = computePool(CHOOSERS, state);
+      btn.disabled = pending || pool.length === 0;
+      if (pool.length === 0) viaEl.textContent = "nothing selected";
+      else if (viaEl.textContent === "nothing selected") viaEl.textContent = "";
+    }
+
+    function sync(){
+      state.builtins = bEl.checked;
+      state.users = uEl.checked;
+      var off = [];
+      var boxes = listEl.querySelectorAll("input[data-slug]");
+      for (var j = 0; j < boxes.length; j++) {
+        if (!boxes[j].checked) off.push(boxes[j].getAttribute("data-slug"));
+      }
+      state.off = off;
+      savePool(state);
+      refresh();
+    }
+
+    bEl.addEventListener("change", sync);
+    uEl.addEventListener("change", sync);
+    listEl.addEventListener("change", sync);
+    refresh();
+
+    btn.addEventListener("click", function(){
+      showErr(card, "");
+      var pool = computePool(CHOOSERS, state);
+      if (!pool.length) return;
+      var chosen = pick(pool);
+      if (chosen.kind === "builtin") {
+        viaEl.textContent = "via " + chosen.name;
+        if (chosen.type === "number") pressNumber(card);
+        else if (chosen.type === "color") pressColor(card);
+        else if (chosen.type === "shape") pressShape(card);
+        else pressList(card, chosen.slug);
+      } else {
+        pending = true;
+        refresh();
+        pressKv(card, chosen.slug, btn).then(function(ok){
+          viaEl.textContent = ok ? "via " + chosen.name : "";
+          pending = false;
+          refresh();
+        });
+      }
+    });
   }
 
   function bindCard(card){
@@ -860,6 +1049,7 @@ const CLIENT_SCRIPT = `
     var slug = card.getAttribute("data-slug");
     var kind = card.getAttribute("data-kind");
     var type = card.getAttribute("data-type");
+    if (type === "meta") { bindMeta(card); return; }
     btn.addEventListener("click", function(){
       showErr(card, "");
       if (kind === "builtin") {
@@ -951,22 +1141,28 @@ const CLIENT_SCRIPT = `
 })();
 `;
 
+// JSON destined for a <script> body: "</script>" inside a string value ends
+// the element, so "<" must be escaped. Same guard listsJson and ldJson use.
+function scriptJson(v) {
+  return JSON.stringify(v).replace(/</g, "\\u003c");
+}
+
 function page(opts) {
   const title = opts.title;
   const desc = opts.desc;
   const canonical = opts.canonical;
-  const listsJson = JSON.stringify({
+  const listsJson = scriptJson({
     animal: ANIMALS,
     "simpsons-character": SIMPSONS,
-  }).replace(/</g, "\\u003c");
-  const ldJson = JSON.stringify({
+  });
+  const ldJson = scriptJson({
     "@context": "https://schema.org",
     "@type": "WebSite",
     name: "random choosers",
     url: "https://random.oddspark.dev/",
     description:
       "A shelf of random choosers: number, color, shape, animal, simpsons character, plus choosers named by visitors with AI-generated lists.",
-  }).replace(/</g, "\\u003c");
+  });
 
   return `<!doctype html>
 <html lang="en">
@@ -1015,7 +1211,10 @@ function page(opts) {
 
 </div>
 
-<script>${CLIENT_SCRIPT.replace("__LISTS__", listsJson)}</script>
+<script>${CLIENT_SCRIPT
+  .replace("__LISTS__", function () { return listsJson; })
+  .replace("__CHOOSERS__", function () { return scriptJson(opts.choosers || []); })
+  .replace("__POOL_FN__", function () { return computePool.toString(); })}</script>
 </body>
 </html>`;
 }
@@ -1207,6 +1406,10 @@ export default {
         }
         if (wantsText(request)) return text(chooserAsText(rec, origin));
         const counts = builtin ? {} : await fetchCounts(env, [slug]);
+        // Only the meta chooser needs the whole shelf; every other
+        // permalink stays at its current single-lookup cost.
+        const choosers =
+          rec.slug === "random" ? buildManifest(await listUserChoosers(env)) : [];
         const cookie = await ensureCookie(request, env);
         const headers = { "cache-control": "no-store" };
         if (cookie.header) headers["set-cookie"] = cookie.header;
@@ -1216,6 +1419,7 @@ export default {
             desc: "Press the button; get a random " + rec.name + ".",
             canonical: "https://random.oddspark.dev/c/" + rec.slug,
             cards: cardHtml(rec, counts[slug]),
+            choosers,
             showCreate: false,
             sitekey: env.TURNSTILE_SITE_KEY || "",
           }),
@@ -1244,6 +1448,7 @@ export default {
             canonical: "https://random.oddspark.dev/",
             lede: "Every card is a button. The built-ins roll in your browser; the rest were named by visitors, with lists written by a model and refreshed daily. One new chooser per person per day.",
             cards,
+            choosers: buildManifest(users),
             showCreate: true,
             sitekey: env.TURNSTILE_SITE_KEY || "",
           }),

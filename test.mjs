@@ -1,4 +1,4 @@
-import worker, { BUILTINS, Counters, slugify } from "./src/worker.js";
+import worker, { BUILTINS, Counters, slugify, computePool } from "./src/worker.js";
 
 /* ------------------------------------------------------------------ *
  * Mocks. No network, no wrangler: KV is a Map, the Counters DO is a
@@ -9,6 +9,7 @@ import worker, { BUILTINS, Counters, slugify } from "./src/worker.js";
 
 const kv = new Map();
 const counterState = new Map();
+let kvListCalls = 0;
 
 const env = {
   COOKIE_SECRET: "test-secret",
@@ -25,6 +26,7 @@ const env = {
       kv.delete(k);
     },
     async list({ prefix }) {
+      kvListCalls++;
       const keys = [...kv.keys()].filter((k) => k.startsWith(prefix)).map((name) => ({ name }));
       return { keys, cursor: "", list_complete: true };
     },
@@ -121,10 +123,10 @@ async function sha256Hex(s) {
 const today = new Date().toISOString().slice(0, 10);
 
 /* 1. Built-in table integrity -------------------------------------- */
-check("five built-ins", BUILTINS.length === 5, BUILTINS.map((b) => b.slug).join(","));
+check("six built-ins", BUILTINS.length === 6, BUILTINS.map((b) => b.slug).join(","));
 check(
   "built-in slugs",
-  ["number", "color", "shape", "animal", "simpsons-character"].every((s) =>
+  ["number", "color", "shape", "animal", "simpsons-character", "random"].every((s) =>
     BUILTINS.some((b) => b.slug === s)
   )
 );
@@ -132,6 +134,64 @@ const animal = BUILTINS.find((b) => b.slug === "animal");
 const simpsons = BUILTINS.find((b) => b.slug === "simpsons-character");
 check("animal list >= 48 items", animal.items.length >= 48, animal.items.length);
 check("simpsons list >= 48 items", simpsons.items.length >= 48, simpsons.items.length);
+
+/* 1b. computePool set math ----------------------------------------- */
+const MANIFEST = [
+  { slug: "random", name: "random random", kind: "builtin", type: "meta" },
+  { slug: "number", name: "number", kind: "builtin", type: "number" },
+  { slug: "color", name: "color", kind: "builtin", type: "color" },
+  { slug: "dino", name: "random dinosaur", kind: "user" },
+  { slug: "pizza", name: "random pizza topping", kind: "user" },
+];
+const ALL_ON = { builtins: true, users: true, off: [] };
+const slugsOf = (p) => p.map((c) => c.slug).sort().join(",");
+
+check(
+  "everything on returns all but self",
+  slugsOf(computePool(MANIFEST, ALL_ON)) === "color,dino,number,pizza",
+  slugsOf(computePool(MANIFEST, ALL_ON))
+);
+check(
+  "never selects itself",
+  computePool(MANIFEST, ALL_ON).every((c) => c.slug !== "random")
+);
+check(
+  "builtins off leaves only user choosers",
+  slugsOf(computePool(MANIFEST, { builtins: false, users: true, off: [] })) === "dino,pizza",
+  slugsOf(computePool(MANIFEST, { builtins: false, users: true, off: [] }))
+);
+check(
+  "users off leaves only built-ins",
+  slugsOf(computePool(MANIFEST, { builtins: true, users: false, off: [] })) === "color,number",
+  slugsOf(computePool(MANIFEST, { builtins: true, users: false, off: [] }))
+);
+check(
+  "both groups off returns empty",
+  computePool(MANIFEST, { builtins: false, users: false, off: [] }).length === 0
+);
+check(
+  "off list excludes named slugs",
+  slugsOf(computePool(MANIFEST, { builtins: true, users: true, off: ["color", "dino"] })) === "number,pizza",
+  slugsOf(computePool(MANIFEST, { builtins: true, users: true, off: ["color", "dino"] }))
+);
+check(
+  "unknown slug in off is harmless",
+  slugsOf(computePool(MANIFEST, { builtins: true, users: true, off: ["gone-forever"] })) === "color,dino,number,pizza"
+);
+// Locks in the exclusion-list decision: a chooser created after a visitor
+// saved preferences must be IN by default, not silently absent forever.
+check(
+  "chooser absent from off[] is included by default",
+  computePool(
+    MANIFEST.concat([{ slug: "brand-new", name: "random new thing", kind: "user" }]),
+    { builtins: true, users: true, off: ["color"] }
+  ).some((c) => c.slug === "brand-new")
+);
+check(
+  "self excluded even when groups are on and off[] is empty",
+  computePool([{ slug: "random", name: "random random", kind: "builtin", type: "meta" }], ALL_ON).length === 0
+);
+check("missing state defaults to everything on", computePool(MANIFEST).length === 4);
 
 /* 2. slugify + collision suffix ------------------------------------ */
 check("slugify basic", slugify("Hello, World!!") === "hello-world", slugify("Hello, World!!"));
@@ -297,7 +357,7 @@ const list = await rList.json();
 check("/api/choosers returns an array", rList.status === 200 && Array.isArray(list));
 check(
   "/api/choosers marks built-ins",
-  list.filter((c) => c.kind === "builtin").length === 5
+  list.filter((c) => c.kind === "builtin").length === 6
 );
 check(
   "/api/choosers includes user choosers",
@@ -306,6 +366,121 @@ check(
 check(
   "/api/choosers shape",
   list.every((c) => typeof c.slug === "string" && typeof c.name === "string" && typeof c.kind === "string")
+);
+
+/* 14. random random card -------------------------------------------- */
+const meta = BUILTINS.find((b) => b.slug === "random");
+check("random is a meta built-in", !!meta && meta.type === "meta" && meta.kind === "builtin");
+check("random has no items list", !!meta && meta.items === undefined);
+
+const rMeta = await worker.fetch(req("/c/random", { headers: { accept: "text/html" } }), env, ctx);
+const metaPageHtml = await rMeta.text();
+check("/c/random returns 200", rMeta.status === 200, rMeta.status);
+// Extract just the random card markup to scope assertions to the card itself
+const cardStart = metaPageHtml.indexOf('<article class="card" data-slug="random"');
+check("meta card markup located", cardStart !== -1);
+const cardEnd = metaPageHtml.indexOf('</article>', cardStart) + '</article>'.length;
+const metaHtml = metaPageHtml.substring(cardStart, cardEnd);
+check("meta card carries data-type=meta", metaHtml.includes('data-type="meta"'));
+check("meta card has group toggles", metaHtml.includes("pool-builtins") && metaHtml.includes("pool-users"));
+check("meta card has a customize list container", metaHtml.includes("pool-list"));
+check("meta card has a via slot", metaHtml.includes('class="via"'));
+check("meta card has no press counter", !/<div class="count">/.test(metaHtml));
+
+/* text mode must survive a built-in with no items list */
+const rMetaTxt = await worker.fetch(req("/c/random", { headers: { accept: "text/plain" } }), env, ctx);
+const metaTxt = await rMetaTxt.text();
+check("/c/random text mode returns 200", rMetaTxt.status === 200, rMetaTxt.status);
+check("meta text names the chooser", metaTxt.includes("random random"), metaTxt.slice(0, 60));
+check("meta text offers no curl press", !metaTxt.includes("/api/pick/random"));
+
+const rHomeTxt = await worker.fetch(req("/", { headers: { accept: "text/plain" } }), env, ctx);
+check("home text mode returns 200", rHomeTxt.status === 200, rHomeTxt.status);
+
+/* a visitor naming their chooser "random" must not squat the built-in */
+const cookieR = await freshCookie();
+const rSquat = await worker.fetch(
+  postJson("/api/create", { name: "random" }, { cookie: "rc_uid=" + cookieR }),
+  env,
+  ctx
+);
+const squat = await rSquat.json();
+check("create named 'random' returns 200", rSquat.status === 200, rSquat.status);
+check("'random' collides to random-<4 hex>", /^random-[0-9a-f]{4}$/.test(squat.slug || ""), squat.slug);
+
+/* 15. manifest inlining -------------------------------------------- */
+const rHome2 = await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx);
+const home2 = await rHome2.text();
+check("home leaves no __CHOOSERS__ placeholder", !home2.includes("__CHOOSERS__"));
+check("home leaves no __POOL_FN__ placeholder", !home2.includes("__POOL_FN__"));
+check("home leaves no __LISTS__ placeholder", !home2.includes("__LISTS__"));
+check("home manifest includes a user chooser", home2.includes('"random-dinosaur"'));
+check("home inlines computePool source", home2.includes("function computePool(manifest, state)"));
+
+const rMeta2 = await worker.fetch(req("/c/random", { headers: { accept: "text/html" } }), env, ctx);
+const meta2 = await rMeta2.text();
+check("/c/random manifest includes a user chooser", meta2.includes('"random-dinosaur"'));
+check("/c/random inlines computePool source", meta2.includes("function computePool(manifest, state)"));
+
+/* the extra KV list is gated on the meta slug */
+const beforeOrdinary = kvListCalls;
+await worker.fetch(req("/c/animal", { headers: { accept: "text/html" } }), env, ctx);
+check("ordinary permalink does not list KV", kvListCalls === beforeOrdinary, kvListCalls - beforeOrdinary);
+const beforeMetaCall = kvListCalls;
+await worker.fetch(req("/c/random", { headers: { accept: "text/html" } }), env, ctx);
+check("meta permalink lists KV once", kvListCalls === beforeMetaCall + 1, kvListCalls - beforeMetaCall);
+
+/* the shipped script parses -- catches typos in a string nothing else checks */
+const scriptMatch = home2.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
+check("client script found in page", !!scriptMatch);
+let parseResult = "no script";
+if (scriptMatch) {
+  try {
+    new Function(scriptMatch[1]);
+    parseResult = true;
+  } catch (e) {
+    parseResult = e.message;
+  }
+}
+check("shipped client script parses", parseResult === true, parseResult);
+
+/* a "$&" in a chooser name must not corrupt the manifest */
+const cookieD = await freshCookie();
+await worker.fetch(
+  postJson("/api/create", { name: "dollar $& sign" }, { cookie: "rc_uid=" + cookieD }),
+  env,
+  ctx
+);
+const rHome3 = await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx);
+const home3 = await rHome3.text();
+const script3 = home3.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
+let parse3 = "no script";
+if (script3) {
+  try {
+    new Function(script3[1]);
+    parse3 = true;
+  } catch (e) {
+    parse3 = e.message;
+  }
+}
+check("manifest survives a $& in a chooser name", parse3 === true, parse3);
+check(
+  "manifest survives a $& in a chooser name (verbatim)",
+  home3.includes('"dollar $& sign"') && !home3.includes("__CHOOSERS__")
+);
+
+/* a chooser name must not be able to close the <script> block early -- */
+const cookieX = await freshCookie();
+await worker.fetch(
+  postJson("/api/create", { name: "x </script> y" }, { cookie: "rc_uid=" + cookieX }),
+  env,
+  ctx
+);
+const rHomeX = await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx);
+const homeX = await rHomeX.text();
+check(
+  "chooser name cannot break out of the script block",
+  homeX.includes("\\u003c/script>") && !homeX.includes('"name":"x </script> y"')
 );
 
 /* report -------------------------------------------------------------- */
