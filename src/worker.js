@@ -831,6 +831,9 @@ const CLIENT_SCRIPT = `
     var maxIn = card.querySelector(".num-max");
     var CAP = 1e12;
     function clamped(input, fallback){
+      // The meta card borrows this function but has no bounds inputs,
+      // so an absent input means "use the default".
+      if (!input) return fallback;
       var v = parseFloat(input.value);
       if (!isFinite(v)) v = fallback;
       v = Math.round(v);
@@ -840,7 +843,11 @@ const CLIENT_SCRIPT = `
       return v;
     }
     var a = clamped(minIn, 1), b = clamped(maxIn, 100);
-    if (a > b) { var t = a; a = b; b = t; minIn.value = a; maxIn.value = b; }
+    if (a > b) {
+      var t = a; a = b; b = t;
+      if (minIn) minIn.value = a;
+      if (maxIn) maxIn.value = b;
+    }
     textResult(card, String(randInt(a, b)), true);
   }
 
@@ -927,12 +934,108 @@ const CLIENT_SCRIPT = `
       });
   }
 
+  /* meta chooser: pool preferences --------------------------------- */
+  var POOL_KEY = "rc_pool";
+
+  function defaultPool(){ return { builtins: true, users: true, off: [] }; }
+
+  function loadPool(){
+    try {
+      var raw = localStorage.getItem(POOL_KEY);
+      if (!raw) return defaultPool();
+      var s = JSON.parse(raw);
+      if (!s || typeof s !== "object") return defaultPool();
+      var known = {};
+      for (var i = 0; i < CHOOSERS.length; i++) known[CHOOSERS[i].slug] = 1;
+      var off = [];
+      if (Object.prototype.toString.call(s.off) === "[object Array]") {
+        for (var k = 0; k < s.off.length; k++) {
+          if (known[s.off[k]]) off.push(s.off[k]);
+        }
+      }
+      return { builtins: s.builtins !== false, users: s.users !== false, off: off };
+    } catch (e) {
+      return defaultPool();
+    }
+  }
+
+  function savePool(state){
+    try { localStorage.setItem(POOL_KEY, JSON.stringify(state)); } catch (e) {}
+  }
+
+  function bindMeta(card){
+    var state = loadPool();
+    var bEl = card.querySelector(".pool-builtins");
+    var uEl = card.querySelector(".pool-users");
+    var listEl = card.querySelector(".pool-list");
+    var viaEl = card.querySelector(".via");
+    var btn = card.querySelector("button.press");
+
+    for (var i = 0; i < CHOOSERS.length; i++) {
+      var c = CHOOSERS[i];
+      if (c.slug === "random") continue;
+      var lab = document.createElement("label");
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.setAttribute("data-slug", c.slug);
+      box.checked = state.off.indexOf(c.slug) === -1;
+      lab.appendChild(box);
+      lab.appendChild(document.createTextNode(" " + c.name));
+      listEl.appendChild(lab);
+    }
+
+    bEl.checked = state.builtins;
+    uEl.checked = state.users;
+
+    function refresh(){
+      var pool = computePool(CHOOSERS, state);
+      btn.disabled = pool.length === 0;
+      if (pool.length === 0) viaEl.textContent = "nothing selected";
+      else if (viaEl.textContent === "nothing selected") viaEl.textContent = "";
+    }
+
+    function sync(){
+      state.builtins = bEl.checked;
+      state.users = uEl.checked;
+      var off = [];
+      var boxes = listEl.querySelectorAll("input[data-slug]");
+      for (var j = 0; j < boxes.length; j++) {
+        if (!boxes[j].checked) off.push(boxes[j].getAttribute("data-slug"));
+      }
+      state.off = off;
+      savePool(state);
+      refresh();
+    }
+
+    bEl.addEventListener("change", sync);
+    uEl.addEventListener("change", sync);
+    listEl.addEventListener("change", sync);
+    refresh();
+
+    btn.addEventListener("click", function(){
+      showErr(card, "");
+      var pool = computePool(CHOOSERS, state);
+      if (!pool.length) return;
+      var chosen = pick(pool);
+      viaEl.textContent = "via " + chosen.name;
+      if (chosen.kind === "builtin") {
+        if (chosen.type === "number") pressNumber(card);
+        else if (chosen.type === "color") pressColor(card);
+        else if (chosen.type === "shape") pressShape(card);
+        else pressList(card, chosen.slug);
+      } else {
+        pressKv(card, chosen.slug, btn);
+      }
+    });
+  }
+
   function bindCard(card){
     var btn = card.querySelector("button.press");
     if (!btn) return;
     var slug = card.getAttribute("data-slug");
     var kind = card.getAttribute("data-kind");
     var type = card.getAttribute("data-type");
+    if (type === "meta") { bindMeta(card); return; }
     btn.addEventListener("click", function(){
       showErr(card, "");
       if (kind === "builtin") {
