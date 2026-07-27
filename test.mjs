@@ -121,10 +121,10 @@ async function sha256Hex(s) {
 const today = new Date().toISOString().slice(0, 10);
 
 /* 1. Built-in table integrity -------------------------------------- */
-check("five built-ins", BUILTINS.length === 5, BUILTINS.map((b) => b.slug).join(","));
+check("six built-ins", BUILTINS.length === 6, BUILTINS.map((b) => b.slug).join(","));
 check(
   "built-in slugs",
-  ["number", "color", "shape", "animal", "simpsons-character"].every((s) =>
+  ["number", "color", "shape", "animal", "simpsons-character", "random"].every((s) =>
     BUILTINS.some((b) => b.slug === s)
   )
 );
@@ -354,7 +354,7 @@ const list = await rList.json();
 check("/api/choosers returns an array", rList.status === 200 && Array.isArray(list));
 check(
   "/api/choosers marks built-ins",
-  list.filter((c) => c.kind === "builtin").length === 5
+  list.filter((c) => c.kind === "builtin").length === 6
 );
 check(
   "/api/choosers includes user choosers",
@@ -364,6 +364,41 @@ check(
   "/api/choosers shape",
   list.every((c) => typeof c.slug === "string" && typeof c.name === "string" && typeof c.kind === "string")
 );
+
+/* 9. random random card -------------------------------------------- */
+const meta = BUILTINS.find((b) => b.slug === "random");
+check("random is a meta built-in", !!meta && meta.type === "meta" && meta.kind === "builtin");
+check("random has no items list", !!meta && meta.items === undefined);
+
+const rMeta = await worker.fetch(req("/c/random", { headers: { accept: "text/html" } }), env, ctx);
+const metaHtml = await rMeta.text();
+check("/c/random returns 200", rMeta.status === 200, rMeta.status);
+check("meta card carries data-type=meta", metaHtml.includes('data-type="meta"'));
+check("meta card has group toggles", metaHtml.includes("pool-builtins") && metaHtml.includes("pool-users"));
+check("meta card has a customize list container", metaHtml.includes("pool-list"));
+check("meta card has a via slot", metaHtml.includes('class="via"'));
+check("meta card has no press counter", !/<div class="count">/.test(metaHtml));
+
+/* text mode must survive a built-in with no items list */
+const rMetaTxt = await worker.fetch(req("/c/random", { headers: { accept: "text/plain" } }), env, ctx);
+const metaTxt = await rMetaTxt.text();
+check("/c/random text mode returns 200", rMetaTxt.status === 200, rMetaTxt.status);
+check("meta text names the chooser", metaTxt.includes("random random"), metaTxt.slice(0, 60));
+check("meta text offers no curl press", !metaTxt.includes("/api/pick/random"));
+
+const rHomeTxt = await worker.fetch(req("/", { headers: { accept: "text/plain" } }), env, ctx);
+check("home text mode returns 200", rHomeTxt.status === 200, rHomeTxt.status);
+
+/* a visitor naming their chooser "random" must not squat the built-in */
+const cookieR = await freshCookie();
+const rSquat = await worker.fetch(
+  postJson("/api/create", { name: "random" }, { cookie: "rc_uid=" + cookieR }),
+  env,
+  ctx
+);
+const squat = await rSquat.json();
+check("create named 'random' returns 200", rSquat.status === 200, rSquat.status);
+check("'random' collides to random-<4 hex>", /^random-[0-9a-f]{4}$/.test(squat.slug || ""), squat.slug);
 
 /* report -------------------------------------------------------------- */
 let fails = 0;

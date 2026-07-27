@@ -59,6 +59,7 @@ export const BUILTINS = [
   { slug: "shape", name: "shape", kind: "builtin", type: "shape", blurb: "a little polygon, drawn fresh each press" },
   { slug: "animal", name: "animal", kind: "builtin", type: "list", items: ANIMALS, blurb: "one of " + ANIMALS.length + " animals" },
   { slug: "simpsons-character", name: "simpsons character", kind: "builtin", type: "list", items: SIMPSONS, blurb: "one of " + SIMPSONS.length + " springfielders" },
+  { slug: "random", name: "random random", kind: "builtin", type: "meta", blurb: "picks a chooser, then picks something from it" },
 ];
 
 const BUILTIN_MAP = Object.fromEntries(BUILTINS.map((b) => [b.slug, b]));
@@ -542,6 +543,16 @@ function cardHtml(c, count) {
       '<label>min <input type="number" class="num-min" value="1" step="1"></label>' +
       '<label>max <input type="number" class="num-max" value="100" step="1"></label>' +
       "</div>";
+  } else if (c.type === "meta") {
+    // The per-chooser list is filled in by the client from the inlined
+    // manifest; cardHtml only ever sees one chooser, not the shelf.
+    controls =
+      '<div class="ctl ctl-pool">' +
+      '<label class="grp"><input type="checkbox" class="pool-builtins" checked> built-ins</label>' +
+      '<label class="grp"><input type="checkbox" class="pool-users" checked> user-made</label>' +
+      "</div>" +
+      '<details class="pool-more"><summary>customize</summary>' +
+      '<div class="pool-list"></div></details>';
   }
   let meta = "";
   if (c.kind !== "builtin") {
@@ -550,6 +561,7 @@ function cardHtml(c, count) {
       (typeof count === "number" ? count + (count === 1 ? " press" : " presses") : "") +
       "</div>";
   }
+  const via = c.type === "meta" ? '<div class="via" aria-live="polite"></div>' : "";
   return (
     '<article class="card" data-slug="' + esc(c.slug) + '" data-kind="' + esc(c.kind) + '"' +
     (c.type ? ' data-type="' + esc(c.type) + '"' : "") +
@@ -557,6 +569,7 @@ function cardHtml(c, count) {
     "<h2>" + esc(c.name) + perm + "</h2>" +
     '<div class="blurb">' + esc(c.blurb || "a generated list, refreshed daily") + "</div>" +
     controls +
+    via +
     '<div class="result" aria-live="polite"><span class="hint">&mdash; press &mdash;</span></div>' +
     '<button class="strike press" type="button">Press</button>' +
     meta +
@@ -649,6 +662,29 @@ const CSS = `
     color:var(--text); font-family:var(--mono); font-size:13px; padding:5px 8px;
   }
   .ctl input:focus{outline:1px solid var(--entropy)}
+
+  .ctl-pool{flex-wrap:wrap}
+  .ctl-pool .grp{
+    display:flex; align-items:center; gap:5px; cursor:pointer;
+    font-size:12px; color:var(--dim);
+  }
+  .pool-more{margin-top:8px}
+  .pool-more summary{
+    color:var(--faint); font-size:10.5px; letter-spacing:.12em;
+    text-transform:uppercase; cursor:pointer;
+  }
+  .pool-list{
+    max-height:132px; overflow-y:auto; margin-top:6px;
+    display:flex; flex-direction:column; gap:4px;
+  }
+  .pool-list label{
+    display:flex; align-items:center; gap:6px;
+    font-size:12px; color:var(--dim); cursor:pointer;
+  }
+  .via{
+    color:var(--faint); font-size:10.5px; letter-spacing:.12em;
+    text-transform:uppercase; min-height:14px;
+  }
 
   .result{
     min-height:64px; display:flex; align-items:center; justify-content:center;
@@ -967,10 +1003,13 @@ const CLIENT_SCRIPT = `
       '<div class="blurb">a generated list, refreshed daily</div>' +
       '<div class="result" aria-live="polite"><span class="hint">&mdash; press &mdash;</span></div>' +
       '<button class="strike press" type="button">Press</button>' +
-      '<div class="count">0 presses</div>' +
       '<div class="card-err" hidden></div>' +
       "</article>";
     var card = wrap.firstChild;
+    var count = document.createElement("div");
+    count.className = "count";
+    count.textContent = "0 presses";
+    card.appendChild(count);
     grid.insertBefore(card, createCard || null);
     bindCard(card);
   }
