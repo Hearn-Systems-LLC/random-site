@@ -1139,22 +1139,28 @@ const CLIENT_SCRIPT = `
 })();
 `;
 
+// JSON destined for a <script> body: "</script>" inside a string value ends
+// the element, so "<" must be escaped. Same guard listsJson and ldJson use.
+function scriptJson(v) {
+  return JSON.stringify(v).replace(/</g, "\\u003c");
+}
+
 function page(opts) {
   const title = opts.title;
   const desc = opts.desc;
   const canonical = opts.canonical;
-  const listsJson = JSON.stringify({
+  const listsJson = scriptJson({
     animal: ANIMALS,
     "simpsons-character": SIMPSONS,
-  }).replace(/</g, "\\u003c");
-  const ldJson = JSON.stringify({
+  });
+  const ldJson = scriptJson({
     "@context": "https://schema.org",
     "@type": "WebSite",
     name: "random choosers",
     url: "https://random.oddspark.dev/",
     description:
       "A shelf of random choosers: number, color, shape, animal, simpsons character, plus choosers named by visitors with AI-generated lists.",
-  }).replace(/</g, "\\u003c");
+  });
 
   return `<!doctype html>
 <html lang="en">
@@ -1205,7 +1211,7 @@ function page(opts) {
 
 <script>${CLIENT_SCRIPT
   .replace("__LISTS__", function () { return listsJson; })
-  .replace("__CHOOSERS__", function () { return JSON.stringify(opts.choosers || []); })
+  .replace("__CHOOSERS__", function () { return scriptJson(opts.choosers || []); })
   .replace("__POOL_FN__", function () { return computePool.toString(); })}</script>
 </body>
 </html>`;

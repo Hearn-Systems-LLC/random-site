@@ -463,6 +463,20 @@ if (script3) {
 }
 check("manifest survives a $& in a chooser name", parse3 === true, parse3);
 
+/* a chooser name must not be able to close the <script> block early -- */
+const cookieX = await freshCookie();
+await worker.fetch(
+  postJson("/api/create", { name: "x </script> y" }, { cookie: "rc_uid=" + cookieX }),
+  env,
+  ctx
+);
+const rHomeX = await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx);
+const homeX = await rHomeX.text();
+check(
+  "chooser name cannot break out of the script block",
+  homeX.includes("\\u003c/script>") && !homeX.includes('"name":"x </script> y"')
+);
+
 /* report -------------------------------------------------------------- */
 let fails = 0;
 for (const r of results) {
