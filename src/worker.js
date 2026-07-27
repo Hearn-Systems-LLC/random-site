@@ -82,7 +82,7 @@ export function computePool(manifest, state) {
   var out = [];
   for (var i = 0; i < manifest.length; i++) {
     var c = manifest[i];
-    if (c.slug === "random") continue;
+    if (c.slug === "random" || c.type === "meta") continue;
     if (c.kind === "builtin" ? !wantBuiltins : !wantUsers) continue;
     if (off.indexOf(c.slug) !== -1) continue;
     out.push(c);
@@ -689,10 +689,12 @@ const CSS = `
   .pool-list label{
     display:flex; align-items:center; gap:6px;
     font-size:12px; color:var(--dim); cursor:pointer;
+    word-break:break-word;
   }
   .via{
     color:var(--faint); font-size:10.5px; letter-spacing:.12em;
     text-transform:uppercase; min-height:14px;
+    word-break:break-word;
   }
 
   .result{

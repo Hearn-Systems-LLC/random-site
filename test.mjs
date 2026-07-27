@@ -191,6 +191,7 @@ check(
   "self excluded even when groups are on and off[] is empty",
   computePool([{ slug: "random", name: "random random", kind: "builtin", type: "meta" }], ALL_ON).length === 0
 );
+check("missing state defaults to everything on", computePool(MANIFEST).length === 4);
 
 /* 2. slugify + collision suffix ------------------------------------ */
 check("slugify basic", slugify("Hello, World!!") === "hello-world", slugify("Hello, World!!"));
@@ -367,7 +368,7 @@ check(
   list.every((c) => typeof c.slug === "string" && typeof c.name === "string" && typeof c.kind === "string")
 );
 
-/* 9. random random card -------------------------------------------- */
+/* 14. random random card -------------------------------------------- */
 const meta = BUILTINS.find((b) => b.slug === "random");
 check("random is a meta built-in", !!meta && meta.type === "meta" && meta.kind === "builtin");
 check("random has no items list", !!meta && meta.items === undefined);
@@ -377,6 +378,7 @@ const metaPageHtml = await rMeta.text();
 check("/c/random returns 200", rMeta.status === 200, rMeta.status);
 // Extract just the random card markup to scope assertions to the card itself
 const cardStart = metaPageHtml.indexOf('<article class="card" data-slug="random"');
+check("meta card markup located", cardStart !== -1);
 const cardEnd = metaPageHtml.indexOf('</article>', cardStart) + '</article>'.length;
 const metaHtml = metaPageHtml.substring(cardStart, cardEnd);
 check("meta card carries data-type=meta", metaHtml.includes('data-type="meta"'));
@@ -406,7 +408,7 @@ const squat = await rSquat.json();
 check("create named 'random' returns 200", rSquat.status === 200, rSquat.status);
 check("'random' collides to random-<4 hex>", /^random-[0-9a-f]{4}$/.test(squat.slug || ""), squat.slug);
 
-/* 10. manifest inlining -------------------------------------------- */
+/* 15. manifest inlining -------------------------------------------- */
 const rHome2 = await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx);
 const home2 = await rHome2.text();
 check("home leaves no __CHOOSERS__ placeholder", !home2.includes("__CHOOSERS__"));
@@ -462,6 +464,10 @@ if (script3) {
   }
 }
 check("manifest survives a $& in a chooser name", parse3 === true, parse3);
+check(
+  "manifest survives a $& in a chooser name (verbatim)",
+  home3.includes('"dollar $& sign"') && !home3.includes("__CHOOSERS__")
+);
 
 /* a chooser name must not be able to close the <script> block early -- */
 const cookieX = await freshCookie();

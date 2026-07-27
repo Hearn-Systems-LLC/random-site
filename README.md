@@ -24,7 +24,7 @@ They are defined as a data table in `src/worker.js` (`BUILTINS`), so the
 homepage grid and the `/c/:slug` permalinks render them identically.
 
 The sixth built-in, `random`, is a meta chooser: it picks one of the others and
-delegates, so the result renders in whatever form that chooser produces -- a
+delegates, so the result renders in whatever form that chooser produces — a
 swatch, a canvas, or a server pick. Which choosers it may land on is set per
 visitor with two group toggles plus a per-chooser `customize` list, stored in
 `localStorage` under `rc_pool`.
