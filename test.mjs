@@ -483,6 +483,22 @@ check(
   homeX.includes("\\u003c/script>") && !homeX.includes('"name":"x </script> y"')
 );
 
+/* 16. Hearn. builder's credit ---------------------------------------- */
+const rCredit = await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx);
+const creditHtml = await rCredit.text();
+const creditStart = creditHtml.indexOf('<a class="built"');
+check("builder's credit present", creditStart !== -1);
+const creditEnd = creditHtml.indexOf("</a>", creditStart) + "</a>".length;
+const credit = creditHtml.slice(creditStart, creditEnd);
+check("credit links to hearn.systems", credit.includes('href="https://hearn.systems"'), credit.slice(0, 60));
+check("credit carries rel=noopener", credit.includes('rel="noopener"'));
+check("mark is labelled for screen readers", credit.includes('aria-label="Hearn."'));
+check("mark is outlined paths, not live text", credit.includes("<path") && !credit.includes("<text"));
+check("mark inherits colour but keeps brand oxide", credit.includes('fill="currentColor"') && credit.includes("#B4502E"));
+// The 404 page has no footer, so it must not carry the credit either.
+const rCredit404 = await worker.fetch(req("/c/nope", { headers: { accept: "text/html" } }), env, ctx);
+check("404 page has no builder's credit", !(await rCredit404.text()).includes('class="built"'));
+
 /* report -------------------------------------------------------------- */
 let fails = 0;
 for (const r of results) {
