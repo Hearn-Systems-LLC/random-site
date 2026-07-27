@@ -54,12 +54,14 @@ const SIMPSONS = [
 ];
 
 export const BUILTINS = [
+  // The meta chooser leads: it picks among all the others, so it reads as
+  // the shelf's header rather than a peer of the cards below it.
+  { slug: "random", name: "random random", kind: "builtin", type: "meta", blurb: "picks a chooser, then picks something from it" },
   { slug: "number", name: "number", kind: "builtin", type: "number", blurb: "an integer between two bounds, inclusive" },
   { slug: "color", name: "color", kind: "builtin", type: "color", blurb: "a hex color; click the code to copy it" },
   { slug: "shape", name: "shape", kind: "builtin", type: "shape", blurb: "a little polygon, drawn fresh each press" },
   { slug: "animal", name: "animal", kind: "builtin", type: "list", items: ANIMALS, blurb: "one of " + ANIMALS.length + " animals" },
   { slug: "simpsons-character", name: "simpsons character", kind: "builtin", type: "list", items: SIMPSONS, blurb: "one of " + SIMPSONS.length + " springfielders" },
-  { slug: "random", name: "random random", kind: "builtin", type: "meta", blurb: "picks a chooser, then picks something from it" },
 ];
 
 const BUILTIN_MAP = Object.fromEntries(BUILTINS.map((b) => [b.slug, b]));
@@ -660,6 +662,42 @@ const CSS = `
     .create-card{grid-column:span 2}
   }
 
+  /* The meta chooser takes the whole first row. Full width is only worth
+     having if the internals use it, so above 900px the card becomes its own
+     two-column grid: pool controls and the press button on the left, the
+     result on the right. Below that it falls back to the normal stacked
+     card, which is what a narrow column wants anyway. */
+  .card[data-type="meta"]{grid-column:1 / -1}
+
+  @media (min-width:900px){
+    .card[data-type="meta"]{
+      display:grid; align-items:start;
+      grid-template-columns:minmax(240px, 22rem) 1fr;
+      /* Row 6 is slack. A tall result (the 300px shape canvas) has to put its
+         height somewhere; without a row that absorbs it, the extra lands on
+         the rows the press button shares and strands it at the bottom of an
+         empty column. */
+      grid-template-rows:auto auto auto auto auto 1fr auto;
+      column-gap:28px;
+    }
+    .card[data-type="meta"] > h2{grid-column:1 / -1; grid-row:1}
+    .card[data-type="meta"] > .blurb{grid-column:1 / -1; grid-row:2}
+    .card[data-type="meta"] > .ctl{grid-column:1; grid-row:3}
+    .card[data-type="meta"] > .pool-more{grid-column:1; grid-row:4}
+    .card[data-type="meta"] > button.press{grid-column:1; grid-row:5}
+    .card[data-type="meta"] > .via{grid-column:2; grid-row:3}
+    .card[data-type="meta"] > .result{grid-column:2; grid-row:4 / 7; align-self:stretch}
+    .card[data-type="meta"] > .card-err{grid-column:1 / -1; grid-row:7}
+  }
+
+  /* Two results are sized as a fraction of the result box, which is right in
+     a narrow column and wrong once the card spans the full grid: the canvas
+     would upscale its fixed 480x300 backing store, and the colour swatch
+     would stretch into a slab. Cap both at the canvas's native width so a
+     wide card shows a bigger result, not a blurrier or clumsier one. */
+  .card[data-type="meta"] .result canvas,
+  .card[data-type="meta"] .result .swatch{max-width:480px}
+
   .card{
     background:var(--panel); border:1px solid var(--rule);
     padding:20px 18px 18px; display:flex; flex-direction:column; gap:12px;
@@ -677,7 +715,9 @@ const CSS = `
     display:flex; align-items:center; gap:7px;
     color:var(--dim); font-size:11px; letter-spacing:.08em; text-transform:uppercase;
   }
-  .ctl input{
+  /* Scoped to number inputs on purpose: the meta chooser's pool checkboxes
+     also live inside a .ctl, and an unscoped width blew them up to 92px. */
+  .ctl input[type="number"]{
     width:92px; background:var(--void); border:1px solid var(--rule);
     color:var(--text); font-family:var(--mono); font-size:13px; padding:5px 8px;
   }
