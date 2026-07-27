@@ -483,7 +483,21 @@ check(
   homeX.includes("\\u003c/script>") && !homeX.includes('"name":"x </script> y"')
 );
 
-/* 16. Hearn. builder's credit ---------------------------------------- */
+/* 16. meta chooser leads the shelf ----------------------------------- */
+check("random is the first built-in", BUILTINS[0].slug === "random", BUILTINS[0].slug);
+const rOrder = await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx);
+const orderHtml = await rOrder.text();
+const slugOrder = [...orderHtml.matchAll(/<article class="card" data-slug="([^"]+)"/g)].map((m) => m[1]);
+check("meta card renders before every other card", slugOrder[0] === "random", slugOrder.slice(0, 3).join(","));
+check("meta card is not repeated", slugOrder.filter((s) => s === "random").length === 1);
+// Full-row span and the number-input scoping are CSS-only, so assert the rules
+// exist rather than their effect. The unscoped `.ctl input` rule sized the
+// pool checkboxes to 92px, so guard against it coming back.
+check("meta card spans the full grid row", orderHtml.includes('.card[data-type="meta"]{grid-column:1 / -1}'));
+check("number-input width is scoped to number inputs", orderHtml.includes('.ctl input[type="number"]{'));
+check("no unscoped .ctl input width rule", !/\.ctl input\{/.test(orderHtml));
+
+/* 17. Hearn. builder's credit ---------------------------------------- */
 const rCredit = await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx);
 const creditHtml = await rCredit.text();
 const creditStart = creditHtml.indexOf('<a class="built"');
