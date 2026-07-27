@@ -975,6 +975,18 @@ const CLIENT_SCRIPT = `
     textResult(card, pick(items), false);
   }
 
+  /* The card a result renders into is not always the card that owns the
+     counter: the meta chooser shows its pick in its own card, but the press
+     belongs to whichever chooser it landed on. Address the counter by slug. */
+  function setCount(slug, n){
+    var cards = document.querySelectorAll(".card[data-slug]");
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i].getAttribute("data-slug") !== slug) continue;
+      var c = cards[i].querySelector(".count");
+      if (c) c.textContent = n + (n === 1 ? " press" : " presses");
+    }
+  }
+
   /* user chooser: server pick -------------------------------------- */
   function pressKv(card, slug, btn){
     btn.disabled = true;
@@ -986,10 +998,7 @@ const CLIENT_SCRIPT = `
       .then(function(r){
         if (!r.ok) throw new Error(r.j && r.j.error ? r.j.error : "HTTP error");
         textResult(card, r.j.item, false);
-        var c = card.querySelector(".count");
-        if (c && typeof r.j.count === "number") {
-          c.textContent = r.j.count + (r.j.count === 1 ? " press" : " presses");
-        }
+        if (typeof r.j.count === "number") setCount(slug, r.j.count);
       })
       .catch(function(e){
         ok = false;
