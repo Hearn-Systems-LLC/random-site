@@ -64,6 +64,32 @@ export const BUILTINS = [
 const BUILTIN_MAP = Object.fromEntries(BUILTINS.map((b) => [b.slug, b]));
 
 /* ------------------------------------------------------------------ *
+ * computePool: which choosers is the "random random" card allowed to
+ * land on, given the visitor's saved preferences?
+ *
+ * Written in the client script's dialect (var / function, no const or
+ * arrows) and deliberately self-contained -- no module-scope reads --
+ * because its SOURCE TEXT is injected into the browser via
+ * .toString(). A reference to anything outside this function body
+ * would work in Node and throw ReferenceError in the browser. That is
+ * also why "random" is hardcoded here rather than shared as a const.
+ * ------------------------------------------------------------------ */
+export function computePool(manifest, state) {
+  var wantBuiltins = !state || state.builtins !== false;
+  var wantUsers = !state || state.users !== false;
+  var off = (state && state.off) || [];
+  var out = [];
+  for (var i = 0; i < manifest.length; i++) {
+    var c = manifest[i];
+    if (c.slug === "random") continue;
+    if (c.kind === "builtin" ? !wantBuiltins : !wantUsers) continue;
+    if (off.indexOf(c.slug) !== -1) continue;
+    out.push(c);
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
  * Crypto helpers
  * ------------------------------------------------------------------ */
 

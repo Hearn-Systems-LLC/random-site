@@ -1,4 +1,4 @@
-import worker, { BUILTINS, Counters, slugify } from "./src/worker.js";
+import worker, { BUILTINS, Counters, slugify, computePool } from "./src/worker.js";
 
 /* ------------------------------------------------------------------ *
  * Mocks. No network, no wrangler: KV is a Map, the Counters DO is a
@@ -132,6 +132,63 @@ const animal = BUILTINS.find((b) => b.slug === "animal");
 const simpsons = BUILTINS.find((b) => b.slug === "simpsons-character");
 check("animal list >= 48 items", animal.items.length >= 48, animal.items.length);
 check("simpsons list >= 48 items", simpsons.items.length >= 48, simpsons.items.length);
+
+/* 1b. computePool set math ----------------------------------------- */
+const MANIFEST = [
+  { slug: "random", name: "random random", kind: "builtin", type: "meta" },
+  { slug: "number", name: "number", kind: "builtin", type: "number" },
+  { slug: "color", name: "color", kind: "builtin", type: "color" },
+  { slug: "dino", name: "random dinosaur", kind: "user" },
+  { slug: "pizza", name: "random pizza topping", kind: "user" },
+];
+const ALL_ON = { builtins: true, users: true, off: [] };
+const slugsOf = (p) => p.map((c) => c.slug).sort().join(",");
+
+check(
+  "everything on returns all but self",
+  slugsOf(computePool(MANIFEST, ALL_ON)) === "color,dino,number,pizza",
+  slugsOf(computePool(MANIFEST, ALL_ON))
+);
+check(
+  "never selects itself",
+  computePool(MANIFEST, ALL_ON).every((c) => c.slug !== "random")
+);
+check(
+  "builtins off leaves only user choosers",
+  slugsOf(computePool(MANIFEST, { builtins: false, users: true, off: [] })) === "dino,pizza",
+  slugsOf(computePool(MANIFEST, { builtins: false, users: true, off: [] }))
+);
+check(
+  "users off leaves only built-ins",
+  slugsOf(computePool(MANIFEST, { builtins: true, users: false, off: [] })) === "color,number",
+  slugsOf(computePool(MANIFEST, { builtins: true, users: false, off: [] }))
+);
+check(
+  "both groups off returns empty",
+  computePool(MANIFEST, { builtins: false, users: false, off: [] }).length === 0
+);
+check(
+  "off list excludes named slugs",
+  slugsOf(computePool(MANIFEST, { builtins: true, users: true, off: ["color", "dino"] })) === "number,pizza",
+  slugsOf(computePool(MANIFEST, { builtins: true, users: true, off: ["color", "dino"] }))
+);
+check(
+  "unknown slug in off is harmless",
+  slugsOf(computePool(MANIFEST, { builtins: true, users: true, off: ["gone-forever"] })) === "color,dino,number,pizza"
+);
+// Locks in the exclusion-list decision: a chooser created after a visitor
+// saved preferences must be IN by default, not silently absent forever.
+check(
+  "chooser absent from off[] is included by default",
+  computePool(
+    MANIFEST.concat([{ slug: "brand-new", name: "random new thing", kind: "user" }]),
+    { builtins: true, users: true, off: ["color"] }
+  ).some((c) => c.slug === "brand-new")
+);
+check(
+  "self excluded even when groups are on and off[] is empty",
+  computePool([{ slug: "random", name: "random random", kind: "builtin", type: "meta" }], ALL_ON).length === 0
+);
 
 /* 2. slugify + collision suffix ------------------------------------ */
 check("slugify basic", slugify("Hello, World!!") === "hello-world", slugify("Hello, World!!"));
