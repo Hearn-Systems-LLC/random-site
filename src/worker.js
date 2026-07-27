@@ -90,6 +90,15 @@ export function computePool(manifest, state) {
   return out;
 }
 
+/* The shape the client needs to reason about a chooser. */
+function manifestEntry(c) {
+  return { slug: c.slug, name: c.name, kind: c.kind, type: c.type };
+}
+
+function buildManifest(users) {
+  return BUILTINS.map(manifestEntry).concat(users.map(manifestEntry));
+}
+
 /* ------------------------------------------------------------------ *
  * Crypto helpers
  * ------------------------------------------------------------------ */
@@ -753,6 +762,8 @@ const CLIENT_SCRIPT = `
   var HEX = "0123456789abcdef";
   var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var LISTS = __LISTS__;
+  var CHOOSERS = __CHOOSERS__;
+  __POOL_FN__
   var SHAPE_COLORS = ["#6E8FB8", "#C9A227", "#E06A3F", "#5E8CA8", "#8FA876", "#B87E9E"];
 
   console.log(
@@ -1077,7 +1088,10 @@ function page(opts) {
 
 </div>
 
-<script>${CLIENT_SCRIPT.replace("__LISTS__", listsJson)}</script>
+<script>${CLIENT_SCRIPT
+  .replace("__LISTS__", function () { return listsJson; })
+  .replace("__CHOOSERS__", function () { return JSON.stringify(opts.choosers || []); })
+  .replace("__POOL_FN__", function () { return computePool.toString(); })}</script>
 </body>
 </html>`;
 }
@@ -1269,6 +1283,10 @@ export default {
         }
         if (wantsText(request)) return text(chooserAsText(rec, origin));
         const counts = builtin ? {} : await fetchCounts(env, [slug]);
+        // Only the meta chooser needs the whole shelf; every other
+        // permalink stays at its current single-lookup cost.
+        const choosers =
+          rec.slug === "random" ? buildManifest(await listUserChoosers(env)) : [];
         const cookie = await ensureCookie(request, env);
         const headers = { "cache-control": "no-store" };
         if (cookie.header) headers["set-cookie"] = cookie.header;
@@ -1278,6 +1296,7 @@ export default {
             desc: "Press the button; get a random " + rec.name + ".",
             canonical: "https://random.oddspark.dev/c/" + rec.slug,
             cards: cardHtml(rec, counts[slug]),
+            choosers,
             showCreate: false,
             sitekey: env.TURNSTILE_SITE_KEY || "",
           }),
@@ -1306,6 +1325,7 @@ export default {
             canonical: "https://random.oddspark.dev/",
             lede: "Every card is a button. The built-ins roll in your browser; the rest were named by visitors, with lists written by a model and refreshed daily. One new chooser per person per day.",
             cards,
+            choosers: buildManifest(users),
             showCreate: true,
             sitekey: env.TURNSTILE_SITE_KEY || "",
           }),

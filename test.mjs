@@ -9,6 +9,7 @@ import worker, { BUILTINS, Counters, slugify, computePool } from "./src/worker.j
 
 const kv = new Map();
 const counterState = new Map();
+let kvListCalls = 0;
 
 const env = {
   COOKIE_SECRET: "test-secret",
@@ -25,6 +26,7 @@ const env = {
       kv.delete(k);
     },
     async list({ prefix }) {
+      kvListCalls++;
       const keys = [...kv.keys()].filter((k) => k.startsWith(prefix)).map((name) => ({ name }));
       return { keys, cursor: "", list_complete: true };
     },
@@ -403,6 +405,63 @@ const rSquat = await worker.fetch(
 const squat = await rSquat.json();
 check("create named 'random' returns 200", rSquat.status === 200, rSquat.status);
 check("'random' collides to random-<4 hex>", /^random-[0-9a-f]{4}$/.test(squat.slug || ""), squat.slug);
+
+/* 10. manifest inlining -------------------------------------------- */
+const rHome2 = await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx);
+const home2 = await rHome2.text();
+check("home leaves no __CHOOSERS__ placeholder", !home2.includes("__CHOOSERS__"));
+check("home leaves no __POOL_FN__ placeholder", !home2.includes("__POOL_FN__"));
+check("home leaves no __LISTS__ placeholder", !home2.includes("__LISTS__"));
+check("home manifest includes a user chooser", home2.includes('"random-dinosaur"'));
+check("home inlines computePool source", home2.includes("function computePool(manifest, state)"));
+
+const rMeta2 = await worker.fetch(req("/c/random", { headers: { accept: "text/html" } }), env, ctx);
+const meta2 = await rMeta2.text();
+check("/c/random manifest includes a user chooser", meta2.includes('"random-dinosaur"'));
+check("/c/random inlines computePool source", meta2.includes("function computePool(manifest, state)"));
+
+/* the extra KV list is gated on the meta slug */
+const beforeOrdinary = kvListCalls;
+await worker.fetch(req("/c/animal", { headers: { accept: "text/html" } }), env, ctx);
+check("ordinary permalink does not list KV", kvListCalls === beforeOrdinary, kvListCalls - beforeOrdinary);
+const beforeMetaCall = kvListCalls;
+await worker.fetch(req("/c/random", { headers: { accept: "text/html" } }), env, ctx);
+check("meta permalink lists KV once", kvListCalls === beforeMetaCall + 1, kvListCalls - beforeMetaCall);
+
+/* the shipped script parses -- catches typos in a string nothing else checks */
+const scriptMatch = home2.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
+check("client script found in page", !!scriptMatch);
+let parseResult = "no script";
+if (scriptMatch) {
+  try {
+    new Function(scriptMatch[1]);
+    parseResult = true;
+  } catch (e) {
+    parseResult = e.message;
+  }
+}
+check("shipped client script parses", parseResult === true, parseResult);
+
+/* a "$&" in a chooser name must not corrupt the manifest */
+const cookieD = await freshCookie();
+await worker.fetch(
+  postJson("/api/create", { name: "dollar $& sign" }, { cookie: "rc_uid=" + cookieD }),
+  env,
+  ctx
+);
+const rHome3 = await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx);
+const home3 = await rHome3.text();
+const script3 = home3.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
+let parse3 = "no script";
+if (script3) {
+  try {
+    new Function(script3[1]);
+    parse3 = true;
+  } catch (e) {
+    parse3 = e.message;
+  }
+}
+check("manifest survives a $& in a chooser name", parse3 === true, parse3);
 
 /* report -------------------------------------------------------------- */
 let fails = 0;
