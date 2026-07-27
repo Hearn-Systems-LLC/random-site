@@ -371,8 +371,12 @@ check("random is a meta built-in", !!meta && meta.type === "meta" && meta.kind =
 check("random has no items list", !!meta && meta.items === undefined);
 
 const rMeta = await worker.fetch(req("/c/random", { headers: { accept: "text/html" } }), env, ctx);
-const metaHtml = await rMeta.text();
+const metaPageHtml = await rMeta.text();
 check("/c/random returns 200", rMeta.status === 200, rMeta.status);
+// Extract just the random card markup to scope assertions to the card itself
+const cardStart = metaPageHtml.indexOf('<article class="card" data-slug="random"');
+const cardEnd = metaPageHtml.indexOf('</article>', cardStart) + '</article>'.length;
+const metaHtml = metaPageHtml.substring(cardStart, cardEnd);
 check("meta card carries data-type=meta", metaHtml.includes('data-type="meta"'));
 check("meta card has group toggles", metaHtml.includes("pool-builtins") && metaHtml.includes("pool-users"));
 check("meta card has a customize list container", metaHtml.includes("pool-list"));

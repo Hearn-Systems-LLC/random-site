@@ -1003,13 +1003,10 @@ const CLIENT_SCRIPT = `
       '<div class="blurb">a generated list, refreshed daily</div>' +
       '<div class="result" aria-live="polite"><span class="hint">&mdash; press &mdash;</span></div>' +
       '<button class="strike press" type="button">Press</button>' +
+      '<div class="count">0 presses</div>' +
       '<div class="card-err" hidden></div>' +
       "</article>";
     var card = wrap.firstChild;
-    var count = document.createElement("div");
-    count.className = "count";
-    count.textContent = "0 presses";
-    card.appendChild(count);
     grid.insertBefore(card, createCard || null);
     bindCard(card);
   }
