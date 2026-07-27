@@ -513,6 +513,55 @@ check("mark inherits colour but keeps brand oxide", credit.includes('fill="curre
 const rCredit404 = await worker.fetch(req("/c/nope", { headers: { accept: "text/html" } }), env, ctx);
 check("404 page has no builder's credit", !(await rCredit404.text()).includes('class="built"'));
 
+/* 18. press counters address the card by slug ------------------------ */
+const rCount = await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx);
+const countHtml = await rCount.text();
+const countScript = countHtml.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/)[1];
+
+// The meta chooser renders another chooser's result in its own card, so a
+// counter lookup scoped to the pressed card silently updates nothing.
+check("no card-scoped counter lookup", !countScript.includes('card.querySelector(".count")'));
+check("counter updated by slug", countScript.includes("setCount(slug, r.j.count)"));
+
+// Pull setCount out of the shipped script and run it against a stub DOM, so
+// the test exercises the same source the browser runs. Brace matching is
+// enough here: setCount's body holds no braces inside string literals.
+function sliceFn(src, name) {
+  const start = src.indexOf("function " + name + "(");
+  if (start === -1) return null;
+  let depth = 0;
+  for (let i = src.indexOf("{", start); i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}" && --depth === 0) return src.slice(start, i + 1);
+  }
+  return null;
+}
+const setCountSrc = sliceFn(countScript, "setCount");
+check("setCount located in shipped script", !!setCountSrc);
+
+function stubCard(slug, hasCount) {
+  const count = hasCount ? { textContent: "" } : null;
+  return { count, getAttribute: (a) => (a === "data-slug" ? slug : null), querySelector: () => count };
+}
+// "random" is the meta card: a built-in, so cardHtml gives it no .count div.
+const stubCards = [stubCard("random", false), stubCard("random-food", true), stubCard("random-planet", true)];
+const setCount = new Function("document", setCountSrc + "\nreturn setCount;")({
+  querySelectorAll: () => stubCards,
+});
+
+setCount("random-food", 4);
+check("landed-on card gets the new count", stubCards[1].count.textContent === "4 presses", stubCards[1].count.textContent);
+check("other cards untouched", stubCards[2].count.textContent === "", stubCards[2].count.textContent);
+setCount("random-planet", 1);
+check("one press is singular", stubCards[2].count.textContent === "1 press", stubCards[2].count.textContent);
+// The meta card has no counter to write to; landing on a built-in must not throw.
+let noCountOk = true;
+try { setCount("random", 9); } catch (e) { noCountOk = e.message; }
+check("counterless card does not throw", noCountOk === true, noCountOk);
+// On /c/<slug> the landed-on chooser's card is not rendered at all.
+setCount("absent-from-page", 7);
+check("slug absent from page is a no-op", stubCards[1].count.textContent === "4 presses", stubCards[1].count.textContent);
+
 /* report -------------------------------------------------------------- */
 let fails = 0;
 for (const r of results) {
