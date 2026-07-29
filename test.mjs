@@ -72,12 +72,18 @@ const env = {
   },
   AI: {
     // 120b -> gpt-oss shape (choices only), a JSON array of 10 items.
+    //         genCalls 1 returns a fixed dirty list for the sanitization
+    //         assertions; setting genItems overrides the payload (used to
+    //         push an oversized, dupe-laden list through the 200 cap).
+    //         Every call is recorded in lastGenCall so the suite can
+    //         assert on the request itself (model, max_tokens, prompt).
     // 20b  -> llama-ish string response, {"allow":false,...} when the
     //         chooser name contains "blocked".
     async run(model, opts) {
       const user = opts.messages[1].content;
       if (model.includes("120b")) {
         genCalls++;
+        lastGenCall = { model: model, opts: opts };
         const items =
           genCalls === 1
             ? [
@@ -85,7 +91,9 @@ const env = {
                 "Triceratops", "Ankylosaurus", "Brontosaurus", "Pterodactyl",
                 "x".repeat(60),
               ]
-            : Array.from({ length: 10 }, (_, i) => "gen-" + genCalls + "-item-" + i);
+            : genItems !== null
+              ? genItems
+              : Array.from({ length: 10 }, (_, i) => "gen-" + genCalls + "-item-" + i);
         return { choices: [{ message: { content: JSON.stringify(items) } }] };
       }
       const blocked = /blocked/i.test(user);
@@ -99,6 +107,8 @@ const env = {
 };
 
 let genCalls = 0;
+let genItems = null;
+let lastGenCall = null;
 const pending = [];
 const ctx = {
   waitUntil(p) {
@@ -284,7 +294,7 @@ check("slug is slugified name", created.slug === "random-dinosaur", created.slug
 const rec = kv.has("c:random-dinosaur") ? JSON.parse(kv.get("c:random-dinosaur")) : null;
 check("KV record stored", !!rec);
 check("record shape", !!(rec && rec.kind === "user" && rec.name === "random dinosaur" && Array.isArray(rec.items)));
-check("record listDay is today", rec && rec.listDay === today, rec && rec.listDay);
+check("record carries no listDay", rec && !("listDay" in rec));
 check("mock 10 sanitized to 8 (dedupe/empty dropped)", rec && rec.items.length === 8, rec && rec.items.length);
 check(
   "items deduped case-insensitively",
@@ -292,6 +302,25 @@ check(
 );
 check("items capped at 48 chars", rec && rec.items.every((i) => i.length > 0 && i.length <= 48));
 check("rate slot consumed after success", kv.has("rl:" + today + ":" + (await sha256Hex(cookie1))));
+
+/* the generation request itself: model, budget, prompt --------------- */
+check(
+  "generation ran on the 120b model",
+  lastGenCall && lastGenCall.model === "@cf/openai/gpt-oss-120b",
+  lastGenCall && lastGenCall.model
+);
+check(
+  "generation budget fits 200 items plus reasoning",
+  lastGenCall && lastGenCall.opts.max_tokens === 16384,
+  lastGenCall && lastGenCall.opts.max_tokens
+);
+check(
+  "prompt asks for the complete list, up to 200",
+  lastGenCall &&
+    lastGenCall.opts.messages[0].content.includes("EVERY distinct item") &&
+    lastGenCall.opts.messages[0].content.includes("up to 200"),
+  lastGenCall && lastGenCall.opts.messages[0].content
+);
 
 /* slug collision: same name from a different cookie gets a suffix --- */
 const cookie2 = await freshCookie();
@@ -303,6 +332,33 @@ const rDup = await worker.fetch(
 const dup = await rDup.json();
 check("collision create returns 200", rDup.status === 200, rDup.status);
 check("collision slug gets -<4 hex> suffix", /^random-dinosaur-[0-9a-f]{4}$/.test(dup.slug || ""), dup.slug);
+
+/* 3b. Oversized model output is capped at 200, deduped first ---------- */
+// 260 items: every 13th is one of three case-stable repeat labels, so the
+// unique count (243) still exceeds the cap -- this exercises cap AND the
+// dedupe that runs before it, in one create.
+genItems = Array.from({ length: 260 }, (_, i) =>
+  i % 13 === 0 ? "Cap-Item-" + (i % 3) : "big-item-" + i
+);
+const cookieBig = await freshCookie();
+const rBig = await worker.fetch(
+  postJson("/api/create", { name: "huge category" }, { cookie: "rc_uid=" + cookieBig }),
+  env,
+  ctx
+);
+genItems = null;
+check("big create returns 200", rBig.status === 200, rBig.status);
+const bigRec = JSON.parse(kv.get("c:huge-category"));
+check("list capped at 200 items", bigRec && bigRec.items.length === 200, bigRec && bigRec.items.length);
+check(
+  "cap output stays deduped case-insensitively",
+  bigRec && new Set(bigRec.items.map((i) => i.toLowerCase())).size === bigRec.items.length
+);
+check(
+  "cap keeps the head of the list in order",
+  bigRec && bigRec.items[0] === "Cap-Item-0" && bigRec.items[1] === "big-item-1",
+  bigRec && bigRec.items.slice(0, 2).join(",")
+);
 
 /* 4. Screening rejection ------------------------------------------- */
 const cookie3 = await freshCookie();
@@ -366,7 +422,9 @@ const rPick2 = await worker.fetch(req("/api/pick/random-dinosaur", { method: "PO
 const pick2 = await rPick2.json();
 check("second pick increments counter", pick2.count === 2, pick2.count);
 
-/* 8. Stale listDay: old item now, regeneration in waitUntil --------- */
+/* 8. Static lists: a press NEVER regenerates, whatever listDay says ---- */
+// Pre-change records may still carry a stale listDay field; it must be
+// ignored entirely -- no waitUntil, no AI list-generation call.
 const staleKey = "c:garden-birds";
 const staleRec = JSON.parse(kv.get(staleKey));
 staleRec.listDay = "2000-01-01";
@@ -376,15 +434,22 @@ const pendingBefore = pending.length;
 
 const rStale = await worker.fetch(req("/api/pick/garden-birds", { method: "POST" }), env, ctx);
 const stalePick = await rStale.json();
-check("stale pick returns 200", rStale.status === 200);
-check("stale pick returns an item from the OLD list", staleRec.items.includes(stalePick.item), stalePick.item);
-check("stale pick scheduled a background refresh", pending.length === pendingBefore + 1);
+check("stale-listDay pick returns 200", rStale.status === 200);
+check("stale-listDay pick returns an item from the SAME list", staleRec.items.includes(stalePick.item), stalePick.item);
+check("stale listDay schedules no background work", pending.length === pendingBefore, pending.length);
+check("stale listDay triggers no AI call", genCalls === genCallsBefore);
+check("stale record is left byte-identical", kv.get(staleKey) === JSON.stringify(staleRec));
 
-await Promise.all(pending.splice(pendingBefore));
-const refreshed = JSON.parse(kv.get(staleKey));
-check("waitUntil refreshed listDay to today", refreshed.listDay === today, refreshed.listDay);
-check("waitUntil replaced the items", genCalls === genCallsBefore + 1 && refreshed.items[0].startsWith("gen-" + genCalls + "-"), refreshed.items[0]);
-check("old list was not blanked on the way", refreshed.items.length >= 8);
+// Same guarantees for a record with no listDay at all.
+delete staleRec.listDay;
+kv.set(staleKey, JSON.stringify(staleRec));
+const pendingBefore2 = pending.length;
+const rNoDay = await worker.fetch(req("/api/pick/garden-birds", { method: "POST" }), env, ctx);
+const noDayPick = await rNoDay.json();
+check("absent-listDay pick returns 200", rNoDay.status === 200);
+check("absent-listDay pick returns an item from the SAME list", staleRec.items.includes(noDayPick.item), noDayPick.item);
+check("absent listDay schedules no background work", pending.length === pendingBefore2, pending.length);
+check("absent listDay triggers no AI call", genCalls === genCallsBefore);
 
 /* 9. Unknown slug pick -> 404 JSON ---------------------------------- */
 const rNoPick = await worker.fetch(req("/api/pick/nope", { method: "POST" }), env, ctx);
@@ -1311,6 +1376,67 @@ const custDom = await runVerify(
   mkVerifyFetch([], { randomness: V_RAND })
 );
 check("verify: custom bounds recompute from min/max", custDom.verdict.className.includes("ok"), custDom.verdict.textContent);
+
+// The mismatch hint is scoped: built-in lists (ship with the site) and
+// visitor-made lists (fixed forever, old-era caveat) fail differently.
+const builtinHintDom = await runVerify(
+  { slug: "animal", round: "777", nonce: V_NONCE, item: "not-on-the-list" },
+  mkVerifyFetch([], { randomness: V_RAND, items: { animal: animal.items } })
+);
+check(
+  "verify: built-in mismatch blames site updates",
+  builtinHintDom.verdict.className.includes("err") && builtinHintDom.verdict.textContent.includes("ship with the site"),
+  builtinHintDom.verdict.textContent
+);
+const userHintDom = await runVerify(
+  { slug: "dino", round: "777", nonce: V_NONCE, item: "not-on-the-list" },
+  mkVerifyFetch([], { randomness: V_RAND, items: { dino: dinoItems } })
+);
+check(
+  "verify: user mismatch cites static lists and the old era",
+  userHintDom.verdict.className.includes("err") &&
+    userHintDom.verdict.textContent.includes("never change") &&
+    userHintDom.verdict.textContent.includes("July 2026"),
+  userHintDom.verdict.textContent
+);
+
+/* 33. end-to-end: a pick on a vestigial-listDay record verifies -------- */
+// The change's core promise, composed: a legacy record still carrying a
+// listDay field is pressed over the API (no regeneration, real proof),
+// then the shipped /verify script recomputes that exact pick.
+const legacyItems = ["sparrow", "starling", "swift", "swallow", "magpie", "rook", "wren", "finch", "heron", "kestrel"];
+kv.set("c:legacy-birds", JSON.stringify({
+  slug: "legacy-birds", name: "legacy birds", kind: "user",
+  items: legacyItems, created: "2026-01-01T00:00:00.000Z", listDay: "2026-01-01",
+}));
+seedBeacon(800000);
+const genCallsPreLegacy = genCalls;
+const pendingPreLegacy = pending.length;
+const rLegacy = await worker.fetch(req("/api/pick/legacy-birds", { method: "POST" }), env, ctx);
+const jLegacy = await rLegacy.json();
+check(
+  "legacy-record pick returns 200 with proof",
+  rLegacy.status === 200 && !!(jLegacy.proof && typeof jLegacy.proof.round === "number"),
+  JSON.stringify(jLegacy.proof)
+);
+check("legacy-record pick comes from the stored list", legacyItems.includes(jLegacy.item), jLegacy.item);
+check(
+  "legacy-record pick triggers no AI call and no background work",
+  genCalls === genCallsPreLegacy && pending.length === pendingPreLegacy
+);
+const legacyDom = await runVerify(
+  { slug: "legacy-birds", round: String(jLegacy.proof.round), nonce: jLegacy.proof.nonce, item: jLegacy.item },
+  mkVerifyFetch([], { randomness: await beaconRandomness(jLegacy.proof.round), items: { "legacy-birds": legacyItems } })
+);
+check(
+  "legacy-record pick verifies end-to-end",
+  legacyDom.verdict.className.includes("ok") && legacyDom.verdict.textContent.includes("matches — verified"),
+  legacyDom.verdict.textContent
+);
+check(
+  "legacy record kept its vestigial listDay",
+  JSON.parse(kv.get("c:legacy-birds")).listDay === "2026-01-01"
+);
 
 /* report -------------------------------------------------------------- */
 let fails = 0;

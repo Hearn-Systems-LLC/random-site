@@ -2,7 +2,7 @@
   "name": "random-choosers",
   "version": "1.0.0",
   "private": true,
-  "description": "random.oddspark.dev - a shelf of random choosers. Built-ins run in the browser; user choosers get an AI-generated list, refreshed daily.",
+  "description": "random.oddspark.dev - a shelf of random choosers. Built-ins run in the browser; user choosers get an AI-generated list, fixed forever.",
   "type": "module",
   "engines": {
     "node": ">=20"

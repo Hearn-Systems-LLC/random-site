@@ -4,9 +4,10 @@
  * A shelf of random choosers. Each chooser is a card with a name, a press
  * button, an inline result, and a press count. Five choosers are built in
  * and run entirely in the browser. Visitors can name a new one ("random
- * dinosaur"); Workers AI writes the item list once at creation, a smaller
- * model screens the name first, and the list is quietly regenerated the
- * first time someone presses it on a later UTC day.
+ * dinosaur"); Workers AI writes the item list once at creation — the full
+ * category, capped at 200 items — a smaller model screens the name first,
+ * and the stored list never changes again, so every pick on it stays
+ * verifiable forever.
  *
  * One file, no build step. Same conventions as oddspark.dev.
  */
@@ -631,7 +632,7 @@ async function freeSlug(env, base) {
  * (out.response is useless); llama-style models return out.response as a
  * string OR as an already-parsed object when the content is valid JSON.
  * aiText() normalizes all three to a string. The gpt-oss models are also
- * reasoning models: max_tokens must be 2048, because smaller caps get
+ * reasoning models: max_tokens must be generous, because smaller caps get
  * eaten by the chain of thought and truncate the JSON.
  * ------------------------------------------------------------------ */
 
@@ -693,16 +694,24 @@ async function screenName(env, name) {
 
 const GEN_SYSTEM = [
   "You write item lists for a 'random X' chooser toy.",
-  "Given a chooser name, respond with a raw JSON array of 64 distinct items that fit the theme.",
+  "Given a chooser name, respond with a raw JSON array of EVERY distinct item in the category, up to 200;",
+  "if the category is smaller, list all of them.",
   "Items are nouns or short phrases, at most a few words each.",
   "No numbering, no commentary, no duplicates, no markdown fence. JSON array only.",
 ].join("\n");
+
+// Lists are written once at creation and never change, so a pick stays
+// verifiable forever. 200 caps completeness where the category is huge
+// (models pad and repeat on very long lists, and creation latency grows);
+// sanitizeItems is the single enforcement point.
+const MAX_LIST_ITEMS = 200;
 
 function sanitizeItems(arr) {
   if (!Array.isArray(arr)) return [];
   const seen = new Set();
   const out = [];
   for (const raw of arr) {
+    if (out.length >= MAX_LIST_ITEMS) break;
     const item = String(raw == null ? "" : raw).trim().slice(0, 48);
     if (!item) continue;
     const key = item.toLowerCase();
@@ -719,7 +728,11 @@ async function generateList(env, name) {
       { role: "system", content: GEN_SYSTEM },
       { role: "user", content: 'Write the item list for a chooser named: "' + name + '"' },
     ],
-    max_tokens: 2048,
+    // 200 items at up to 48 chars each is ~2-3k tokens of JSON; the rest
+    // of the budget is headroom for this reasoning model's chain of
+    // thought. Worst-case truncation still fails safe: JSON.parse throws,
+    // the create 502s, and the day's rate slot is never consumed.
+    max_tokens: 16384,
     temperature: 0.9,
   });
   const raw = stripFence(aiText(out));
@@ -800,7 +813,10 @@ async function fetchCounts(env, slugs) {
 }
 
 /* ------------------------------------------------------------------ *
- * KV records: c:<slug> -> {slug, name, kind:"user", items, created, listDay}
+ * KV records: c:<slug> -> {slug, name, kind:"user", items, created}
+ * The list is immutable: written once at creation, never regenerated.
+ * (Records from before lists became static (July 2026) also carry a
+ * vestigial listDay field, which is no longer read or written anywhere.)
  * ------------------------------------------------------------------ */
 
 async function getUserChooser(env, slug) {
@@ -822,21 +838,6 @@ async function listUserChoosers(env) {
   } while (cursor);
   out.sort((a, b) => String(a.created || "").localeCompare(String(b.created || "")));
   return out;
-}
-
-// Daily refresh: regenerate the list for a chooser whose listDay is stale.
-// On any failure the old list is kept; it is never blanked.
-async function refreshList(env, slug, name) {
-  try {
-    const items = await generateList(env, name);
-    const rec = await env.CHOOSERS.get("c:" + slug, { type: "json" });
-    if (!rec) return;
-    rec.items = items;
-    rec.listDay = utcDay();
-    await env.CHOOSERS.put("c:" + slug, JSON.stringify(rec));
-  } catch (e) {
-    /* keep the old list */
-  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -915,7 +916,7 @@ function chooserAsText(c, origin) {
     L.push("  " + c.blurb);
     L.push("  press it:  curl -X POST " + origin + "/api/pick/" + c.slug);
   } else {
-    L.push("  " + c.items.length + " items on the list, refreshed daily.");
+    L.push("  " + c.items.length + " items on the list, fixed at creation; it never changes.");
     L.push("  press it:  curl -X POST " + origin + "/api/pick/" + c.slug);
   }
   L.push("");
@@ -1004,7 +1005,7 @@ function cardHtml(c, count) {
     (c.type ? ' data-type="' + esc(c.type) + '"' : "") +
     ">" +
     "<h2>" + esc(c.name) + perm + "</h2>" +
-    '<div class="blurb">' + esc(c.blurb || "a generated list, refreshed daily") + "</div>" +
+    '<div class="blurb">' + esc(c.blurb || "a generated list, fixed forever") + "</div>" +
     controls +
     via +
     '<div class="result" aria-live="polite"><span class="hint">&mdash; press &mdash;</span></div>' +
@@ -1020,7 +1021,7 @@ function createCardHtml(sitekey) {
   return (
     '<article class="card create-card" id="create-card">' +
     "<h2>new chooser</h2>" +
-    '<div class="blurb">name it; a model writes the list, another screens the name. one per day.</div>' +
+    '<div class="blurb">name it; a model writes the list once, another screens the name. the list never changes, so closed categories work best. one per day.</div>' +
     '<form id="create-form">' +
     '<input type="text" id="create-name" maxlength="60" required ' +
     'placeholder="random dinosaur" autocomplete="off">' +
@@ -1837,7 +1838,7 @@ const CLIENT_SCRIPT = `
       var token = tokenField ? tokenField.value : "";
       createBtn.disabled = true;
       status.className = "create-status";
-      status.textContent = "verifying and generating the list; this can take 30-60 seconds. hold on.";
+      status.textContent = "verifying and generating the whole list; this can take up to a couple of minutes. hold on.";
       fetch("/api/create", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1885,7 +1886,7 @@ const CLIENT_SCRIPT = `
     wrap.innerHTML =
       '<article class="card" data-slug="' + esc(slug) + '" data-kind="user">' +
       "<h2>" + esc(name) + ' <a class="perm" href="/c/' + esc(slug) + '" title="permalink">&para;</a></h2>' +
-      '<div class="blurb">a generated list, refreshed daily</div>' +
+      '<div class="blurb">a generated list, fixed forever</div>' +
       '<div class="result" aria-live="polite"><span class="hint">&mdash; press &mdash;</span></div>' +
       '<div class="proof" aria-live="polite"></div>' +
       '<button class="strike press" type="button">Press</button>' +
@@ -2108,7 +2109,11 @@ const VERIFY_SCRIPT = `
                 (via ? " (the chooser draw behind a random random press depends on the presser's pool and is not recomputable here.)" : ""), "ok");
             } else {
               say("does not verify — round " + round + " + this nonce computes \\"" + computed + "\\", not \\"" + item + "\\"." +
-                (type === "list" ? " visitor-made lists are rewritten daily; a pick from an earlier day can no longer be recomputed." : ""), "err");
+                (type === "list"
+                  ? (TYPES[slug]
+                    ? " built-in lists ship with the site and can change when the site is updated; a pick made before such an update may no longer recompute."
+                    : " visitor-made lists never change, so this should have recomputed — unless the chooser was created before lists became static (July 2026), when lists rotated daily, including on the changeover day.")
+                  : ""), "err");
             }
           });
       })
@@ -2156,10 +2161,14 @@ function verifyPage() {
     straight from the beacon. Paste the details from a pick, or follow the
     &ldquo;verified &middot; round N&rdquo; badge under any result, which fills
     this in for you.</p>
-    <p>Picks from visitor-made choosers verify against the item list as it was
-    at press time. Those lists regenerate daily, so a pick from an earlier day
-    &mdash; or one made around the daily regeneration &mdash; may not
-    recompute. That is an honest mismatch, not proof of rigging.</p>
+    <p>Visitor-made lists are fixed at creation and never change, so a pick
+    on one recomputes forever, against the same list. Built-in lists ship
+    with the site itself and can change when the site is updated, so a pick
+    made before such an update may not recompute. One honest caveat for the
+    old era: choosers created before lists became static (July 2026) rotated
+    daily back then, including on the changeover day, so a pick from that
+    era may not recompute either. That is an honest mismatch, not proof of
+    rigging.</p>
     <form id="verify-form">
       <div class="row">
         <label>chooser slug <input id="v-slug" autocomplete="off" placeholder="number"></label>
@@ -2298,7 +2307,8 @@ async function handleCreate(request, env) {
     return json({ error: "could not generate a list for that name; try another" }, 502);
   }
 
-  // 6. store, then consume the day's rate slot
+  // 6. store, then consume the day's rate slot. The list is immutable from
+  // here on: nothing ever regenerates it.
   const slug = await freeSlug(env, slugify(name));
   const rec = {
     slug,
@@ -2306,7 +2316,6 @@ async function handleCreate(request, env) {
     kind: "user",
     items,
     created: new Date().toISOString(),
-    listDay: utcDay(),
   };
   await env.CHOOSERS.put("c:" + slug, JSON.stringify(rec));
   await env.CHOOSERS.put(rl, "1", { expirationTtl: RL_TTL });
@@ -2347,7 +2356,7 @@ export function builtinPick(c) {
   return null;
 }
 
-async function handlePick(request, env, ctx, slug) {
+async function handlePick(request, env, slug) {
   const builtin = BUILTIN_MAP[slug];
 
   // Resolve what this press can land on BEFORE committing to a round, so
@@ -2398,9 +2407,6 @@ async function handlePick(request, env, ctx, slug) {
     if (!target) return json({ error: "no pick: chooser vanished mid-press" }, 404);
     const item = target.items[await draw(chosen.slug, 1, target.items.length)];
     const count = await hitCounter(env, chosen.slug);
-    if (target.listDay !== utcDay() && ctx && typeof ctx.waitUntil === "function") {
-      ctx.waitUntil(refreshList(env, chosen.slug, target.name));
-    }
     return json({ slug, name: builtin.name, via, item, count, proof });
   }
 
@@ -2409,11 +2415,6 @@ async function handlePick(request, env, ctx, slug) {
 
   const item = target.items[await draw(slug, 0, target.items.length)];
   const count = await hitCounter(env, slug);
-
-  // Stale list? Regenerate in the background; the press returns now.
-  if (target.listDay !== utcDay() && ctx && typeof ctx.waitUntil === "function") {
-    ctx.waitUntil(refreshList(env, slug, target.name));
-  }
 
   return json({ slug, name: target.name, item, count, proof });
 }
@@ -2435,7 +2436,7 @@ export default {
 
       if (path.startsWith("/api/pick/") && request.method === "POST") {
         const slug = decodeURIComponent(path.split("/").pop() || "").toLowerCase();
-        return await handlePick(request, env, ctx, slug);
+        return await handlePick(request, env, slug);
       }
 
       if (path === "/api/choosers") {
@@ -2529,7 +2530,7 @@ export default {
             title: "random choosers",
             desc: "A shelf of random choosers. Press a card, get a thing. Name your own and a model writes the list.",
             canonical: "https://random.oddspark.dev/",
-            lede: "Every card is a button. The built-ins roll in your browser; the rest were named by visitors, with lists written by a model and refreshed daily. One new chooser per person per day.",
+            lede: "Every card is a button. The built-ins roll in your browser; the rest were named by visitors, with lists written once by a model and fixed forever. One new chooser per person per day.",
             cards,
             choosers: buildManifest(users),
             showCreate: true,

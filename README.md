@@ -82,8 +82,8 @@ badge: **verified · round N**, linking to a prefilled
 `/verify?slug=&round=&nonce=&item=` (plus `&via=` when the meta chooser
 delegated, `&min=&max=` for non-default number bounds). `/verify` fetches the
 round from drand in the visitor's own browser and recomputes the item;
-visitor-made lists are rewritten daily, so their picks only recompute
-same-day. API responses carry the same `proof: {round, nonce}`.
+visitor-made lists never change, so their picks recompute forever, against
+the same list. API responses carry the same `proof: {round, nonce}`.
 
 If the beacon is unreachable (or a number span exceeds 2³², which 32-bit hash
 words can't draw from), the press falls back to a local
@@ -109,30 +109,37 @@ Cloudflare Turnstile widget, submit. `POST /api/create` then runs, in order:
    `{"allow": true|false, "reason": "..."}`. Sexual, hateful, harassing,
    illegal, and PII-soliciting names are rejected with 403 and never stored.
 5. **AI list generation** — `@cf/openai/gpt-oss-120b` is prompted for a raw
-   JSON array of 64 distinct short items. The response is sanitized (trim,
-   drop empties, dedupe case-insensitively, cap 48 chars/item); fewer than 8
-   valid items fails the creation with 502.
+   JSON array of EVERY distinct item in the category, up to 200 (or all of
+   them, when the category is smaller). The response is sanitized (trim,
+   drop empties, dedupe case-insensitively, cap 48 chars/item, cap 200
+   items); fewer than 8 valid items fails the creation with 502.
 6. **Store** — `c:<slug>` in KV:
-   `{slug, name, kind: "user", items, created, listDay}`. Slugs are
+   `{slug, name, kind: "user", items, created}`. Slugs are
    lowercased, non-alphanumerics collapsed to `-`, max 40 chars; collisions
    (against KV and built-in slugs) get a `-<4 hex>` suffix.
 
 Model response shapes are normalized by one helper (`aiText`): the gpt-oss
 models only populate OpenAI-style `choices[0].message.content`, while
 llama-style models return `response` as a string *or* as an already-parsed
-object. Both gpt-oss models are reasoning models, so calls use
-`max_tokens: 2048` — smaller caps get eaten by the chain of thought and
-truncate the JSON.
+object. Both gpt-oss models are reasoning models, so calls need generous
+`max_tokens` (16384 for list generation, 2048 for screening) — smaller caps
+get eaten by the chain of thought and truncate the JSON.
 
-### Daily refresh
+### Static lists
+
+The list is written once, at creation, and **never changes**: no
+regeneration on press, on schedule, or ever. That is what makes every pick
+on a visitor-made chooser permanently verifiable — `/verify` recomputes
+against the same list via `GET /api/items/:slug` no matter how much later
+it runs. (Choosers created before lists became static (July 2026) had
+lists that rotated daily back then, including on the changeover day; their
+records may still carry a vestigial `listDay` field, which is no longer
+read or written anywhere.)
 
 `POST /api/pick/:slug` derives an item from the committed beacon round (see
 above; falls back to `crypto.getRandomValues` with `proof: null` when the
 beacon is down, repeats allowed either way) and increments the press counter
-in the `Counters` Durable Object. If the record's `listDay` is not today's UTC
-date, a list regeneration is kicked off via `ctx.waitUntil` — the press returns
-the current item immediately, and on any generation failure the old list is
-kept, never blanked.
+in the `Counters` Durable Object.
 
 ## Routes
 
@@ -180,8 +187,10 @@ switches on model name (120b returns a 10-item JSON array in gpt-oss shape,
 stubbed to answer only drand beacon URLs (deterministic randomness per round;
 anything else throws), and Turnstile is bypassed because `TURNSTILE_SECRET` is
 unset. Covers builtin integrity, slugify and collision suffixes,
-create/reject/rate-limit flows, picks and counters, the stale-`listDay`
-background refresh, permalinks, the curl text path, `/api/choosers`, the
+create/reject/rate-limit flows, the 200-item cap and case-insensitive
+dedupe, picks and counters, the static-list guarantee (a press on a record
+with a stale or absent `listDay` triggers no background work and no AI
+call), permalinks, the curl text path, `/api/choosers`, the
 beacon round math, derivation vectors and uniformity, client/server
 derivation equivalence via the shipped script, proof fields on every
 `/api/pick` shape, beacon-down fallback, the poll loop, and the `/verify`
