@@ -145,6 +145,387 @@ function randomIndex(n) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Verifiable randomness: drand quicknet commit-reveal
+ *
+ * Every pick commits to a beacon round plus a fresh 8-byte nonce minted
+ * at commit time, waits for the round to be published, and derives the
+ * pick deterministically:
+ *
+ *   seed = sha256hex(randomness + ":" + nonce + ":" + slug + ":" + drawIx)
+ *
+ * walked as eight uint32 words with the same rejection sampling as
+ * randomIndex (on exhaustion, rehash seed + ":" + k for k = 0, 1, ...).
+ *
+ * Draw scheme per chooser type. base is 0 for a direct pick and 1 when a
+ * meta pick already spent draw 0 choosing the chooser:
+ *   number: base      -> index in [0, max-min+1); item = min + index
+ *   color:  base..+5  -> one hex digit each, [0, 16)
+ *   shape:  base      -> sides [0, 7) + 3; base+1 -> palette index;
+ *           base+2    -> filled [0, 2). Angle/radius jitter in the
+ *           drawing stays cosmetic and is no part of the item.
+ *   list:   base      -> index in [0, items.length)
+ *   meta:   0         -> pool index (slug "random"), then the item draws
+ *           above at base 1 against the chosen chooser's slug.
+ *
+ * derivePick, deriveItem and probeBeaconRound are written in the client
+ * script's dialect (var / function, no const or arrows) and deliberately
+ * self-contained -- no module-scope reads -- because their SOURCE TEXT
+ * is injected into the browser via .toString() (the computePool /
+ * __POOL_FN__ pattern), so the homepage, the server and the /verify
+ * page run byte-identical logic. That is why the chain parameters are
+ * inlined as literals inside the first two (the probe takes its base
+ * URL as an argument). beaconRoundForTime/beaconPublishTime keep the
+ * same dialect but are used module-side only (round math and tests).
+ * ------------------------------------------------------------------ */
+
+const BEACON_CHAIN = "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971";
+const BEACON_URL = "https://drand.cloudflare.com/" + BEACON_CHAIN + "/public/";
+
+// Polling cadence, mutable so tests can shrink it; production keeps the
+// documented ~1s interval and ~18s cap.
+export const beaconTiming = { intervalMs: 1000, capMs: 18000 };
+
+// The first round of drand quicknet (genesis 1692803367, 3s period) not
+// yet published at nowMs: the round of the 3-second window starting now.
+// NOTE: not the commit target -- see probeBeaconRound. Kept for the
+// round/publish-time math and tests.
+export function beaconRoundForTime(nowMs) {
+  return Math.floor((Math.floor(nowMs / 1000) - 1692803367) / 3) + 1;
+}
+
+// Nominal publication instant of a round, in seconds. The gateway in
+// fact emits ahead of this schedule by an amount that varies wildly
+// across anycast backends (measured 2026-07-28: +1 to +14 rounds),
+// which is exactly why the commit target is probed, not computed.
+export function beaconPublishTime(round) {
+  return 1692803367 + (round - 1) * 3;
+}
+
+// Deterministic uniform index in [0, n) from beacon randomness. Returns
+// a promise; null when n exceeds 2^32, which 32-bit hash words cannot
+// draw from (callers fall back to a local pick, badged unverified).
+export function derivePick(randomness, nonce, slug, drawIx, n) {
+  if (!(n > 1)) return Promise.resolve(0);
+  if (n > 4294967296) return Promise.resolve(null);
+  var input = randomness + ":" + nonce + ":" + slug + ":" + drawIx;
+  var limit = Math.floor(4294967296 / n) * n;
+  function hashHex(s) {
+    return crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)).then(function (buf) {
+      var b = new Uint8Array(buf);
+      var hex = "";
+      for (var i = 0; i < b.length; i++) hex += (b[i] < 16 ? "0" : "") + b[i].toString(16);
+      return hex;
+    });
+  }
+  function attempt(seed, k) {
+    return hashHex(k < 0 ? seed : seed + ":" + k).then(function (hex) {
+      for (var i = 0; i < 8; i++) {
+        var x = parseInt(hex.substr(i * 8, 8), 16);
+        if (x < limit) return x % n;
+      }
+      return attempt(seed, k + 1);
+    });
+  }
+  return attempt(input, -1);
+}
+
+// The deterministic counterpart of builtinPick: same item strings, drawn
+// from beacon randomness instead of crypto.getRandomValues. c carries
+// {type, items?, min?, max?}; palette is the shared SHAPE_COLORS. Draw
+// indices follow the scheme documented above.
+export function deriveItem(c, palette, randomness, nonce, slug, base) {
+  if (c.type === "number") {
+    var a = typeof c.min === "number" ? c.min : 1;
+    var b = typeof c.max === "number" ? c.max : 100;
+    return derivePick(randomness, nonce, slug, base, b - a + 1).then(function (i) {
+      return i === null ? null : String(a + i);
+    });
+  }
+  if (c.type === "color") {
+    var digits = [];
+    for (var i = 0; i < 6; i++) digits.push(derivePick(randomness, nonce, slug, base + i, 16));
+    return Promise.all(digits).then(function (ix) {
+      var HEXC = "0123456789abcdef";
+      var hex = "#";
+      for (var k = 0; k < 6; k++) hex += HEXC[ix[k]];
+      return hex;
+    });
+  }
+  if (c.type === "shape") {
+    return Promise.all([
+      derivePick(randomness, nonce, slug, base, 7),
+      derivePick(randomness, nonce, slug, base + 1, palette.length),
+      derivePick(randomness, nonce, slug, base + 2, 2),
+    ]).then(function (r) {
+      var sides = 3 + r[0];
+      var color = palette[r[1]];
+      var filled = r[2] === 0;
+      // "an 8-sided polygon" -- eight is the only vertex count in 3..9
+      // that takes "an", since the article follows the spoken digit.
+      var article = sides === 8 ? "an " : "a ";
+      return article + sides + "-sided polygon in " + color + (filled ? ", filled" : ", outlined");
+    });
+  }
+  if (c.type === "list" && c.items && c.items.length) {
+    return derivePick(randomness, nonce, slug, base, c.items.length).then(function (i) {
+      return i === null ? null : c.items[i];
+    });
+  }
+  return Promise.resolve(null);
+}
+
+// Probe-forward commit target. The gateway's publication horizon is
+// inconsistent across anycast backends (measured: +1 to +14 rounds ahead
+// of the genesis schedule, and 404s get cached ~27s), so no computed
+// round is reliably unpublished at commit time. Instead: seed from
+// /public/latest, then probe the next 10 rounds IN PARALLEL with
+// cache-busted requests and commit to the lowest 404 -- the first round
+// this gateway path will not serve yet. Parallel, not sequential: some
+// backends HOLD a frontier request for a full period (~3s, measured)
+// until the round is produced, so a sequential walk chases the moving
+// frontier forever (measured: 10 probes, ~30s, zero 404s); in parallel
+// only the immediate next round(s) hold and the rest 404 at once.
+// Documented caveat: a DIFFERENT backend may already serve the committed
+// round; the guarantee is "unpublished on the path this press is using".
+// All-200 (long-poll backends produced every probed round) commits to
+// the last probed round + 1 with the poll cap as backstop; all-errors
+// (or a /public/latest failure) returns null and callers fall back to a
+// local pick, badged "unverified". Probes AND the /public/latest seed
+// time out at 6s, so a blackholed connection cannot hang a press.
+//
+// Written in the client script's dialect and self-contained (baseUrl and
+// fetch come in as arguments): its source ships to the browser via
+// DERIVE_FNS_SRC below, so server and browser probe identically.
+export function probeBeaconRound(baseUrl, fetchImpl) {
+  var doFetch = fetchImpl || fetch;
+  var attempt = 0;
+  function bust(url) {
+    return doFetch(url + (url.indexOf("?") === -1 ? "?" : "&") + "p=" + attempt++);
+  }
+  // HTTP status of one probed round; 0 on network error, -1 on timeout.
+  function statusOf(round) {
+    return Promise.race([
+      bust(baseUrl + round).then(function (res) {
+        var status = res.status;
+        return res.arrayBuffer().then(
+          function () { return status; },
+          function () { return status; }
+        );
+      }, function () { return 0; }),
+      new Promise(function (resolve) { setTimeout(function () { resolve(-1); }, 6000); }),
+    ]);
+  }
+  // The seed fetch gets the same 6s backstop as the probes: a blackholed
+  // connection (content blocker, VPN, filtered DNS) must fall back to a
+  // local pick, not pin the card on "awaiting beacon" forever.
+  return Promise.race([
+    bust(baseUrl + "latest").then(function (res) {
+      if (!res.ok) return null;
+      return res.json().then(function (j) {
+        if (!j || typeof j.round !== "number") return null;
+        return j.round + 1;
+      });
+    }, function () { return null; }),
+    new Promise(function (resolve) { setTimeout(function () { resolve(null); }, 6000); }),
+  ])
+    .then(function (start) {
+      if (start === null) return null;
+      var probes = [];
+      for (var k = 0; k < 10; k++) probes.push(statusOf(start + k));
+      return Promise.all(probes).then(function (statuses) {
+        var served = 0;
+        for (var i = 0; i < statuses.length; i++) {
+          if (statuses[i] === 404) return start + i; // lowest round this path will not serve
+          if (statuses[i] === 200) served++;
+        }
+        // Every probe served (long-poll backends): commit past the bound.
+        // Every probe failed: the gateway is unreachable for us.
+        return served > 0 ? start + 10 : null;
+      });
+    })
+    .catch(function () {
+      return null;
+    });
+}
+
+// The injected bundle: homepage client script and /verify page both get
+// this verbatim, so derivation cannot drift between press and verify.
+// beaconRoundForTime/beaconPublishTime stay module-side (tests only) --
+// the client commits via the probe, never the schedule.
+//
+// It is a STRING, not fn.toString(), on purpose: the worker is bundled by
+// esbuild in both `wrangler dev` and `wrangler deploy`, and the bundler
+// rewrites nested function declarations with its keepNames __name helper
+// (`__name(bust, "bust")` and friends). __name does not exist in the
+// browser, so every toString-injected press died with "Uncaught
+// ReferenceError: __name is not defined", thrown synchronously before the
+// promise chain could catch it -- the 2026-07-29 "awaiting beacon
+// forever" bug. A string literal survives bundling untouched. The test
+// suite asserts this string is byte-identical to the module functions'
+// sources, so the two copies cannot drift silently. Keep them in sync.
+// (Exported through a function because workerd rejects non-function
+// module exports.)
+const DERIVE_FNS_SRC_TEXT = `function derivePick(randomness, nonce, slug, drawIx, n) {
+  if (!(n > 1)) return Promise.resolve(0);
+  if (n > 4294967296) return Promise.resolve(null);
+  var input = randomness + ":" + nonce + ":" + slug + ":" + drawIx;
+  var limit = Math.floor(4294967296 / n) * n;
+  function hashHex(s) {
+    return crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)).then(function (buf) {
+      var b = new Uint8Array(buf);
+      var hex = "";
+      for (var i = 0; i < b.length; i++) hex += (b[i] < 16 ? "0" : "") + b[i].toString(16);
+      return hex;
+    });
+  }
+  function attempt(seed, k) {
+    return hashHex(k < 0 ? seed : seed + ":" + k).then(function (hex) {
+      for (var i = 0; i < 8; i++) {
+        var x = parseInt(hex.substr(i * 8, 8), 16);
+        if (x < limit) return x % n;
+      }
+      return attempt(seed, k + 1);
+    });
+  }
+  return attempt(input, -1);
+}
+function deriveItem(c, palette, randomness, nonce, slug, base) {
+  if (c.type === "number") {
+    var a = typeof c.min === "number" ? c.min : 1;
+    var b = typeof c.max === "number" ? c.max : 100;
+    return derivePick(randomness, nonce, slug, base, b - a + 1).then(function (i) {
+      return i === null ? null : String(a + i);
+    });
+  }
+  if (c.type === "color") {
+    var digits = [];
+    for (var i = 0; i < 6; i++) digits.push(derivePick(randomness, nonce, slug, base + i, 16));
+    return Promise.all(digits).then(function (ix) {
+      var HEXC = "0123456789abcdef";
+      var hex = "#";
+      for (var k = 0; k < 6; k++) hex += HEXC[ix[k]];
+      return hex;
+    });
+  }
+  if (c.type === "shape") {
+    return Promise.all([
+      derivePick(randomness, nonce, slug, base, 7),
+      derivePick(randomness, nonce, slug, base + 1, palette.length),
+      derivePick(randomness, nonce, slug, base + 2, 2),
+    ]).then(function (r) {
+      var sides = 3 + r[0];
+      var color = palette[r[1]];
+      var filled = r[2] === 0;
+      // "an 8-sided polygon" -- eight is the only vertex count in 3..9
+      // that takes "an", since the article follows the spoken digit.
+      var article = sides === 8 ? "an " : "a ";
+      return article + sides + "-sided polygon in " + color + (filled ? ", filled" : ", outlined");
+    });
+  }
+  if (c.type === "list" && c.items && c.items.length) {
+    return derivePick(randomness, nonce, slug, base, c.items.length).then(function (i) {
+      return i === null ? null : c.items[i];
+    });
+  }
+  return Promise.resolve(null);
+}
+function probeBeaconRound(baseUrl, fetchImpl) {
+  var doFetch = fetchImpl || fetch;
+  var attempt = 0;
+  function bust(url) {
+    return doFetch(url + (url.indexOf("?") === -1 ? "?" : "&") + "p=" + attempt++);
+  }
+  // HTTP status of one probed round; 0 on network error, -1 on timeout.
+  function statusOf(round) {
+    return Promise.race([
+      bust(baseUrl + round).then(function (res) {
+        var status = res.status;
+        return res.arrayBuffer().then(
+          function () { return status; },
+          function () { return status; }
+        );
+      }, function () { return 0; }),
+      new Promise(function (resolve) { setTimeout(function () { resolve(-1); }, 6000); }),
+    ]);
+  }
+  // The seed fetch gets the same 6s backstop as the probes: a blackholed
+  // connection (content blocker, VPN, filtered DNS) must fall back to a
+  // local pick, not pin the card on "awaiting beacon" forever.
+  return Promise.race([
+    bust(baseUrl + "latest").then(function (res) {
+      if (!res.ok) return null;
+      return res.json().then(function (j) {
+        if (!j || typeof j.round !== "number") return null;
+        return j.round + 1;
+      });
+    }, function () { return null; }),
+    new Promise(function (resolve) { setTimeout(function () { resolve(null); }, 6000); }),
+  ])
+    .then(function (start) {
+      if (start === null) return null;
+      var probes = [];
+      for (var k = 0; k < 10; k++) probes.push(statusOf(start + k));
+      return Promise.all(probes).then(function (statuses) {
+        var served = 0;
+        for (var i = 0; i < statuses.length; i++) {
+          if (statuses[i] === 404) return start + i; // lowest round this path will not serve
+          if (statuses[i] === 200) served++;
+        }
+        // Every probe served (long-poll backends): commit past the bound.
+        // Every probe failed: the gateway is unreachable for us.
+        return served > 0 ? start + 10 : null;
+      });
+    })
+    .catch(function () {
+      return null;
+    });
+}`;
+
+// workerd only accepts function/ExportedHandler module exports, so the
+// string above is reachable to tests (and nothing else) through this.
+export function deriveFnsSrc() {
+  return DERIVE_FNS_SRC_TEXT;
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Poll the beacon until the committed round is published; returns its
+// randomness hex, or null after the cap (callers fall back to a local
+// pick badged "unverified"). Never throws.
+//
+// The per-attempt query busts the gateway's per-node caches: a first 404
+// is cached ~27s on some anycast nodes (measured 2026-07-29), which would
+// otherwise hide the publication from our own subsequent polls. Same
+// chain, same endpoint -- the gateway ignores the query.
+export async function awaitBeaconRound(round, fetchImpl, sleepImpl) {
+  const doFetch = fetchImpl || fetch;
+  const doSleep = sleepImpl || sleepMs;
+  const start = Date.now();
+  let attempt = 0;
+  for (;;) {
+    try {
+      // Each attempt gets ~6s: a blackholed fetch must not hang the
+      // press forever. (Real sleepMs here, not doSleep -- tests inject a
+      // zero sleep for the cadence but must not shorten the backstop.)
+      const res = await Promise.race([
+        doFetch(BEACON_URL + round + "?p=" + round + "-" + attempt++),
+        sleepMs(6000).then(() => null),
+      ]);
+      if (res && res.ok) {
+        const j = await res.json();
+        if (j && j.randomness) return String(j.randomness);
+      }
+    } catch (e) {
+      /* beacon hiccup: keep polling until the cap */
+    }
+    if (Date.now() - start > beaconTiming.capMs) return null;
+    await doSleep(beaconTiming.intervalMs);
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * Signed cookie: rc_uid = "<16 random bytes hex>.<HMAC-SHA256 hex>"
  * One per visitor; gates the one-creation-per-UTC-day rate limit.
  * COOKIE_FALLBACK_SECRET exists so local dev without the secret still
@@ -627,6 +1008,7 @@ function cardHtml(c, count) {
     controls +
     via +
     '<div class="result" aria-live="polite"><span class="hint">&mdash; press &mdash;</span></div>' +
+    '<div class="proof" aria-live="polite"></div>' +
     '<button class="strike press" type="button">Press</button>' +
     meta +
     '<div class="card-err" hidden></div>' +
@@ -711,7 +1093,7 @@ const CSS = `
          height somewhere; without a row that absorbs it, the extra lands on
          the rows the press button shares and strands it at the bottom of an
          empty column. */
-      grid-template-rows:auto auto auto auto auto 1fr auto;
+      grid-template-rows:auto auto auto auto auto 1fr auto auto;
       column-gap:28px;
     }
     .card[data-type="meta"] > h2{grid-column:1 / -1; grid-row:1}
@@ -721,7 +1103,8 @@ const CSS = `
     .card[data-type="meta"] > button.press{grid-column:1; grid-row:5}
     .card[data-type="meta"] > .via{grid-column:2; grid-row:3}
     .card[data-type="meta"] > .result{grid-column:2; grid-row:4 / 7; align-self:stretch}
-    .card[data-type="meta"] > .card-err{grid-column:1 / -1; grid-row:7}
+    .card[data-type="meta"] > .proof{grid-column:2; grid-row:7}
+    .card[data-type="meta"] > .card-err{grid-column:1 / -1; grid-row:8}
   }
 
   /* Two results are sized as a fraction of the result box, which is right in
@@ -776,11 +1159,12 @@ const CSS = `
     font-size:12px; color:var(--dim); cursor:pointer;
     word-break:break-word;
   }
-  .via{
+  .via,.proof{
     color:var(--faint); font-size:10.5px; letter-spacing:.12em;
     text-transform:uppercase; min-height:14px;
     word-break:break-word;
   }
+  .proof .unverified{color:#E06A3F}
 
   .result{
     min-height:64px; display:flex; align-items:center; justify-content:center;
@@ -850,6 +1234,30 @@ const CSS = `
   }
   .notfound p{font-family:var(--serif); font-size:17px; color:var(--dim)}
 
+  .verify{margin-top:40px; max-width:640px}
+  .verify h1{
+    font-family:var(--serif); font-weight:400; font-size:31px; color:#E4EAF0;
+    margin:0 0 14px;
+  }
+  .verify p{font-family:var(--serif); font-size:16px; color:var(--dim)}
+  .verify form{display:flex; flex-direction:column; gap:10px; margin:22px 0 16px}
+  .verify label{
+    display:flex; flex-direction:column; gap:4px;
+    color:var(--dim); font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+  }
+  .verify input{
+    background:var(--void); border:1px solid var(--rule); color:var(--text);
+    font-family:var(--mono); font-size:13px; padding:8px 10px;
+  }
+  .verify input:focus{outline:1px solid var(--entropy)}
+  .verify .row{display:flex; gap:10px}
+  .verify .row label{flex:1}
+  .verify button.strike{align-self:flex-start}
+  .verdict{min-height:20px; font-size:13px; word-break:break-word}
+  .verdict.ok{color:var(--entropy)}
+  .verdict.err{color:#E06A3F}
+  .drand-link{font-size:11px; color:var(--faint)}
+
   @media (prefers-reduced-motion:reduce){
     *{animation:none !important; transition:none !important}
   }
@@ -863,6 +1271,12 @@ const CLIENT_SCRIPT = `
   var CHOOSERS = __CHOOSERS__;
   __POOL_FN__
   var SHAPE_COLORS = __SHAPE_COLORS__;
+  __DERIVE_FN__
+  var BEACON_URL = "https://drand.cloudflare.com/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971/public/";
+  // Poll cadence, injected from the server's beaconTiming so there is one
+  // source of truth.
+  var BEACON_INTERVAL_MS = __BEACON_INTERVAL_MS__;
+  var BEACON_CAP_MS = __BEACON_CAP_MS__;
 
   console.log(
     "%c random choosers %c press a card, get a thing ",
@@ -888,6 +1302,56 @@ const CLIENT_SCRIPT = `
     return Math.floor(min + rand() * (max - min + 1));
   }
   function pick(arr){ return arr[Math.floor(rand() * arr.length)]; }
+
+  /* verifiable randomness: commit to a drand round, wait, derive ------ */
+
+  function sleep(ms){
+    return new Promise(function(resolve){ setTimeout(resolve, ms); });
+  }
+
+  // 8 random bytes as hex, minted at commit time. The committed round is
+  // unpublished at commit on the gateway path this press is using (see
+  // probeBeaconRound); another anycast backend may already serve it --
+  // that is the documented limit of the guarantee.
+  function mintNonce(){
+    var b = new Uint8Array(8);
+    crypto.getRandomValues(b);
+    var h = "";
+    for (var i = 0; i < b.length; i++) h += (b[i] < 16 ? "0" : "") + b[i].toString(16);
+    return h;
+  }
+
+  // Poll the committed round until published; null after the cap means
+  // the beacon stalled (a backend flip can put publication past the cap)
+  // and the pick falls back to a local one, badged "unverified". A 200
+  // without randomness counts as not-yet-ready and keeps polling, same
+  // as the server. Each attempt gets ~6s so a blackholed fetch cannot
+  // pin the card on "awaiting beacon".
+  function fetchBeacon(round){
+    var start = Date.now();
+    var attempt = 0;
+    function attemptFetch(){
+      // The query busts the gateway's per-node caches: a first 404 is
+      // cached ~27s on some nodes, which would otherwise hide the
+      // publication from our own later polls.
+      attempt++;
+      var req = fetch(BEACON_URL + round + "?p=" + round + "-" + attempt)
+        .then(function(res){
+          if (!res.ok) throw new Error("round not published");
+          return res.json();
+        });
+      return Promise.race([req, sleep(6000).then(function(){ return null; })])
+        .then(function(j){
+          if (j && j.randomness) return String(j.randomness);
+          throw new Error("not ready");
+        })
+        .catch(function(){
+          if (Date.now() - start > BEACON_CAP_MS) return null;
+          return sleep(BEACON_INTERVAL_MS).then(attemptFetch);
+        });
+    }
+    return attemptFetch();
+  }
 
   function scramble(node, finalText){
     if (reduce || !finalText) { node.textContent = finalText || ""; return; }
@@ -916,6 +1380,44 @@ const CLIENT_SCRIPT = `
     e.textContent = msg || "";
   }
 
+  function proofEl(card){ return card.querySelector(".proof"); }
+  function clearProof(card){
+    var p = proofEl(card);
+    if (p) p.innerHTML = "";
+  }
+
+  // The badge under the result: a /verify link carrying everything a
+  // verifier needs, or a plain "unverified" for fallback picks. via is
+  // set when a meta pick spent draw 0 choosing the chooser; min/max only
+  // ride along when the number bounds are not the 1-100 default.
+  // proof.round comes from a server response, so it is coerced before
+  // anywhere near innerHTML.
+  function showProof(card, proof){
+    var p = proofEl(card);
+    if (!p) return;
+    var round = proof && parseInt(proof.round, 10);
+    if (!proof || !isFinite(round)) {
+      p.innerHTML = '<span class="unverified">unverified</span>';
+      return;
+    }
+    var href =
+      "/verify?slug=" + encodeURIComponent(proof.slug) +
+      "&round=" + round +
+      "&nonce=" + encodeURIComponent(proof.nonce) +
+      "&item=" + encodeURIComponent(proof.item);
+    if (proof.via) href += "&via=" + encodeURIComponent(proof.via);
+    if (proof.min != null && (proof.min !== 1 || proof.max !== 100)) {
+      href += "&min=" + proof.min + "&max=" + proof.max;
+    }
+    p.innerHTML = '<a href="' + href + '">verified &middot; round ' + round + "</a>";
+  }
+
+  function pendingBeacon(card, round){
+    var r = resultEl(card);
+    r.className = "result";
+    r.innerHTML = '<span class="hint">awaiting beacon' + (round ? " round " + round : "") + "&hellip;</span>";
+  }
+
   function textResult(card, text, big){
     var r = resultEl(card);
     r.className = "result";
@@ -924,7 +1426,7 @@ const CLIENT_SCRIPT = `
   }
 
   /* built-in: number ----------------------------------------------- */
-  function pressNumber(card){
+  function numberBounds(card){
     var minIn = card.querySelector(".num-min");
     var maxIn = card.querySelector(".num-max");
     var CAP = 1e12;
@@ -946,13 +1448,15 @@ const CLIENT_SCRIPT = `
       if (minIn) minIn.value = a;
       if (maxIn) maxIn.value = b;
     }
-    textResult(card, String(randInt(a, b)), true);
+    return { a: a, b: b };
+  }
+  function pressNumber(card){
+    var nb = numberBounds(card);
+    textResult(card, String(randInt(nb.a, nb.b)), true);
   }
 
   /* built-in: color ------------------------------------------------ */
-  function pressColor(card){
-    var hex = "#";
-    for (var i = 0; i < 6; i++) hex += HEX[randInt(0, 15)];
+  function renderColorResult(card, hex){
     var r = resultEl(card);
     r.className = "result color-result";
     r.innerHTML =
@@ -965,9 +1469,16 @@ const CLIENT_SCRIPT = `
       setTimeout(function(){ code.textContent = hex; }, 1200);
     };
   }
+  function pressColor(card){
+    var hex = "#";
+    for (var i = 0; i < 6; i++) hex += HEX[randInt(0, 15)];
+    renderColorResult(card, hex);
+  }
 
   /* built-in: shape ------------------------------------------------ */
-  function pressShape(card){
+  // n/color/filled decide the polygon; the angle and radius jitter stays
+  // cosmetic local randomness and is no part of the verified item.
+  function drawShape(card, n, color, filled){
     var r = resultEl(card);
     r.className = "result";
     var cv = r.querySelector("canvas");
@@ -980,9 +1491,7 @@ const CLIENT_SCRIPT = `
     var ctx = cv.getContext("2d");
     var W = cv.width, H = cv.height;
     ctx.clearRect(0, 0, W, H);
-    var n = randInt(3, 9);
     var cx = W / 2, cy = H / 2, base = Math.min(W, H) * 0.36;
-    var color = pick(SHAPE_COLORS);
     ctx.beginPath();
     for (var i = 0; i < n; i++) {
       var ang = (i / n) * Math.PI * 2 + rand() * 0.35;
@@ -991,7 +1500,7 @@ const CLIENT_SCRIPT = `
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
     ctx.closePath();
-    if (rand() < 0.5) {
+    if (filled) {
       ctx.fillStyle = color;
       ctx.globalAlpha = 0.85;
       ctx.fill();
@@ -1001,12 +1510,103 @@ const CLIENT_SCRIPT = `
       ctx.stroke();
     }
   }
+  // Renders a derived shape from its item string, so the text form (what
+  // /verify checks) and the drawing can never drift apart.
+  function renderShapeResult(card, item){
+    var m = /(\d+)-sided polygon in (#[0-9A-Fa-f]{6}), (filled|outlined)/.exec(item);
+    if (!m) { textResult(card, item, false); return; }
+    drawShape(card, parseInt(m[1], 10), m[2], m[3] === "filled");
+  }
+  function pressShape(card){
+    drawShape(card, randInt(3, 9), pick(SHAPE_COLORS), rand() < 0.5);
+  }
+
+  // Renders a derived item in the card's usual form: swatch for color,
+  // canvas for shape, text otherwise.
+  function renderItem(card, type, item){
+    if (type === "color") renderColorResult(card, item);
+    else if (type === "shape") renderShapeResult(card, item);
+    else textResult(card, item, type === "number");
+  }
+
+  // The pre-beacon local pick, now the fallback path whenever the beacon
+  // cannot be reached. Always badged "unverified" by the caller.
+  function localBuiltin(card, slug, type){
+    if (type === "number") pressNumber(card);
+    else if (type === "color") pressColor(card);
+    else if (type === "shape") pressShape(card);
+    else pressList(card, slug);
+  }
 
   /* built-in: list ------------------------------------------------- */
   function pressList(card, slug){
     var items = LISTS[slug] || [];
     if (!items.length) { showErr(card, "no list loaded"); return; }
     textResult(card, pick(items), false);
+  }
+
+  /* commit-reveal for built-in presses ------------------------------ */
+  // Commit to the first round this gateway path will not serve yet,
+  // wait for it, and derive the pick from it (draw 0 onward; the meta
+  // chooser has its own flow with base 1). Any failure -- beacon down,
+  // round never published, span too wide -- falls back to a local pick
+  // badged "unverified"; a press must never break the card or leave its
+  // button disabled.
+  function pressVerified(card, slug, btn){
+    var type = card.getAttribute("data-type");
+    var desc = { type: type };
+    if (type === "list") {
+      desc.items = LISTS[slug] || [];
+      if (!desc.items.length) { showErr(card, "no list loaded"); return; }
+    }
+    if (type === "number") {
+      var nb = numberBounds(card);
+      desc.min = nb.a;
+      desc.max = nb.b;
+      if (nb.b - nb.a + 1 > 4294967296) {
+        // A span wider than 2^32 cannot be drawn from 32-bit hash words.
+        localBuiltin(card, slug, type);
+        showProof(card, null);
+        return;
+      }
+    }
+    btn.disabled = true;
+    showErr(card, "");
+    clearProof(card);
+    pendingBeacon(card, 0); // generic until the probe picks the round
+    var nonce = mintNonce();
+    function fallback(){
+      localBuiltin(card, slug, type);
+      showProof(card, null);
+    }
+    function rescue(){
+      // The fallback itself must not be able to strand the button.
+      try { fallback(); }
+      catch (e2) { showErr(card, "no pick: " + (e2 && e2.message ? e2.message : e2)); }
+    }
+    // The probe call is wrapped so even a SYNCHRONOUS throw (a broken
+    // bundle was exactly this, 2026-07-29) becomes a rejection that the
+    // rescue catches, instead of stranding the card on "awaiting beacon".
+    Promise.resolve()
+      .then(function () { return probeBeaconRound(BEACON_URL, fetch); })
+      .then(function(round){
+        if (round === null) { fallback(); return null; }
+        pendingBeacon(card, round);
+        return fetchBeacon(round).then(function(randomness){
+          if (!randomness) { fallback(); return null; }
+          return deriveItem(desc, SHAPE_COLORS, randomness, nonce, slug, 0)
+            .then(function(item){
+              if (item == null) { fallback(); return; }
+              renderItem(card, type, item);
+              showProof(card, {
+                slug: slug, round: round, nonce: nonce, item: item,
+                min: desc.min, max: desc.max
+              });
+            });
+        });
+      })
+      .catch(rescue)
+      .then(function(){ btn.disabled = false; });
   }
 
   /* The card a result renders into is not always the card that owns the
@@ -1022,8 +1622,11 @@ const CLIENT_SCRIPT = `
   }
 
   /* user chooser: server pick -------------------------------------- */
+  // The server does its own commit-reveal; the badge carries the proof
+  // from its response (proof: null when the beacon failed server-side).
   function pressKv(card, slug, btn){
     btn.disabled = true;
+    clearProof(card);
     var ok = true;
     return fetch("/api/pick/" + encodeURIComponent(slug), { method: "POST" })
       .then(function(res){
@@ -1032,6 +1635,9 @@ const CLIENT_SCRIPT = `
       .then(function(r){
         if (!r.ok) throw new Error(r.j && r.j.error ? r.j.error : "HTTP error");
         textResult(card, r.j.item, false);
+        showProof(card, r.j.proof
+          ? { slug: slug, round: r.j.proof.round, nonce: r.j.proof.nonce, item: r.j.item }
+          : null);
         if (typeof r.j.count === "number") setCount(slug, r.j.count);
       })
       .catch(function(e){
@@ -1129,23 +1735,72 @@ const CLIENT_SCRIPT = `
       showErr(card, "");
       var pool = computePool(CHOOSERS, state);
       if (!pool.length) return;
-      var chosen = pick(pool);
-      if (chosen.kind === "builtin") {
-        viaEl.textContent = "via " + chosen.name;
-        if (chosen.type === "number") pressNumber(card);
-        else if (chosen.type === "color") pressColor(card);
-        else if (chosen.type === "shape") pressShape(card);
-        else pressList(card, chosen.slug);
-      } else {
-        pending = true;
-        refresh();
-        pressKv(card, chosen.slug, btn).then(function(ok){
-          viaEl.textContent = ok ? "via " + chosen.name : "";
+      clearProof(card);
+      pending = true;
+      refresh();
+      pendingBeacon(card, 0); // generic until the probe picks the round
+      var nonce = mintNonce();
+      // Wrapped like pressVerified: a synchronous throw from the probe
+      // must reach the catch below, not strand the meta button.
+      Promise.resolve()
+        .then(function () { return probeBeaconRound(BEACON_URL, fetch); })
+        .then(function(round){
+          if (round === null) return finish(pick(pool), null);
+          pendingBeacon(card, round);
+          return fetchBeacon(round).then(function(randomness){
+            if (!randomness) return finish(pick(pool), null);
+            // Draw 0 chooses the chooser, draw 1 the item -- one round,
+            // one nonce, exactly what /verify recomputes with via=random.
+            return derivePick(randomness, nonce, "random", 0, pool.length)
+              .then(function(i){
+                return finish(pool[i], { round: round, nonce: nonce, randomness: randomness });
+              });
+          });
+        })
+        .catch(function(){
+          // Same rule as pressVerified: a throwing fallback must not
+          // strand the meta button in the disabled state.
+          try { return finish(pick(pool), null); }
+          catch (e) { showErr(card, "no pick: " + (e && e.message ? e.message : e)); return null; }
+        })
+        .then(function(){
           pending = false;
           refresh();
         });
-      }
     });
+
+    function finish(chosen, beacon){
+      if (chosen.kind === "builtin") {
+        viaEl.textContent = "via " + chosen.name;
+        if (!beacon) {
+          localBuiltin(card, chosen.slug, chosen.type);
+          showProof(card, null);
+          return null;
+        }
+        var desc = { type: chosen.type };
+        if (chosen.type === "list") desc.items = LISTS[chosen.slug] || [];
+        // The meta card has no bounds inputs; number keeps its 1-100
+        // default, matching the server-side pick of the same chooser.
+        return deriveItem(desc, SHAPE_COLORS, beacon.randomness, beacon.nonce, chosen.slug, 1)
+          .then(function(item){
+            if (item == null) {
+              localBuiltin(card, chosen.slug, chosen.type);
+              showProof(card, null);
+              return;
+            }
+            renderItem(card, chosen.type, item);
+            showProof(card, {
+              slug: chosen.slug, round: beacon.round, nonce: beacon.nonce,
+              item: item, via: "random"
+            });
+          });
+      }
+      // A visitor-made chooser is a real server press with its own
+      // commit-reveal; the badge carries that response's proof.
+      return pressKv(card, chosen.slug, btn).then(function(ok){
+        viaEl.textContent = ok ? "via " + chosen.name : "";
+      });
+    }
   }
 
   function bindCard(card){
@@ -1158,10 +1813,7 @@ const CLIENT_SCRIPT = `
     btn.addEventListener("click", function(){
       showErr(card, "");
       if (kind === "builtin") {
-        if (type === "number") pressNumber(card);
-        else if (type === "color") pressColor(card);
-        else if (type === "shape") pressShape(card);
-        else pressList(card, slug);
+        pressVerified(card, slug, btn);
       } else {
         pressKv(card, slug, btn);
       }
@@ -1235,6 +1887,7 @@ const CLIENT_SCRIPT = `
       "<h2>" + esc(name) + ' <a class="perm" href="/c/' + esc(slug) + '" title="permalink">&para;</a></h2>' +
       '<div class="blurb">a generated list, refreshed daily</div>' +
       '<div class="result" aria-live="polite"><span class="hint">&mdash; press &mdash;</span></div>' +
+      '<div class="proof" aria-live="polite"></div>' +
       '<button class="strike press" type="button">Press</button>' +
       '<div class="count">0 presses</div>' +
       '<div class="card-err" hidden></div>' +
@@ -1316,6 +1969,7 @@ function page(opts) {
 
   <footer>
     <a href="/api/choosers">json</a>
+    <a href="/verify">verify</a>
     <span>random.oddspark.dev</span>
     <span>built-ins run in your browser; the rest are one press each</span>
     <a class="built" href="https://hearn.systems" rel="noopener">built by ${HEARN_MARK}</a>
@@ -1327,6 +1981,206 @@ function page(opts) {
   .replace("__LISTS__", function () { return listsJson; })
   .replace("__CHOOSERS__", function () { return scriptJson(opts.choosers || []); })
   .replace("__POOL_FN__", function () { return computePool.toString(); })
+  .replace("__SHAPE_COLORS__", function () { return scriptJson(SHAPE_COLORS); })
+  .replace("__DERIVE_FN__", function () { return DERIVE_FNS_SRC_TEXT; })
+  .replace("__BEACON_INTERVAL_MS__", function () { return String(beaconTiming.intervalMs); })
+  .replace("__BEACON_CAP_MS__", function () { return String(beaconTiming.capMs); })}</script>
+</body>
+</html>`;
+}
+
+/* ------------------------------------------------------------------ *
+ * /verify: independent recomputation of any verified pick.
+ *
+ * The page is deliberately dumb: the form is prefilled from the query
+ * string (badge links land ready to run), the visitor's browser fetches
+ * the round from drand directly (CORS is open), and the same injected
+ * DERIVE_FNS the press ran recomputes the item. No BLS verification in
+ * page -- the verdict links out to the beacon round instead.
+ * ------------------------------------------------------------------ */
+
+// Chooser slug -> derivation scheme, built from the table so a new
+// built-in cannot drift. Unknown (visitor-made) slugs are lists.
+const VERIFY_TYPES = Object.fromEntries(BUILTINS.map((b) => [b.slug, b.type]));
+
+/* Same constraint as CLIENT_SCRIPT: string concatenation only inside. */
+const VERIFY_SCRIPT = `
+(function(){
+  __DERIVE_FN__
+  var TYPES = __VERIFY_TYPES__;
+  var PALETTE = __SHAPE_COLORS__;
+  var BEACON_URL = "https://drand.cloudflare.com/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971/public/";
+  var FIELDS = ["slug", "round", "nonce", "item", "via", "min", "max"];
+
+  function el(id){ return document.getElementById("v-" + id); }
+  function say(msg, cls){
+    var v = document.getElementById("verdict");
+    v.className = "verdict" + (cls ? " " + cls : "");
+    v.textContent = msg;
+  }
+
+  // Prefill from the query string; badge links land here ready to run.
+  var q = new URLSearchParams(location.search);
+  for (var i = 0; i < FIELDS.length; i++) {
+    var val = q.get(FIELDS[i]);
+    if (val !== null) el(FIELDS[i]).value = val;
+  }
+
+  function sleepVerify(ms){
+    return new Promise(function(resolve){ setTimeout(resolve, ms); });
+  }
+
+  // Cache-busted, with retries: the press's own probe may have cached a
+  // 404 for this round (~27s on some nodes), so one bare 404 is not
+  // proof the round does not exist.
+  function fetchRound(round){
+    var attempt = 0;
+    function once(){
+      attempt++;
+      return fetch(BEACON_URL + round + "?v=" + round + "-" + attempt)
+        .then(function(res){
+          if (res.status === 404 && attempt < 3) return sleepVerify(1000).then(once);
+          if (!res.ok) throw new Error("the beacon answered HTTP " + res.status);
+          return res.json();
+        });
+    }
+    return once();
+  }
+
+  function run(){
+    var slug = el("slug").value.trim().toLowerCase();
+    var round = parseInt(el("round").value, 10);
+    var nonce = el("nonce").value.trim();
+    var item = el("item").value;
+    var via = el("via").value.trim().toLowerCase();
+    if (!slug || !(round > 0) || !nonce || !item) {
+      say("slug, round, nonce and item are required.", "err");
+      return;
+    }
+    var type = TYPES[slug] || "list";
+    if (type === "meta") {
+      say("a random random pick verifies through the chooser it landed on; use the link from its badge.", "err");
+      return;
+    }
+    var desc = { type: type };
+    // A meta pick spent draw 0 choosing the chooser, so its item
+    // draws start at 1. Direct picks start at 0.
+    var base = via ? 1 : 0;
+    if (type === "number") {
+      desc.min = el("min").value !== "" ? Math.round(parseFloat(el("min").value)) : 1;
+      desc.max = el("max").value !== "" ? Math.round(parseFloat(el("max").value)) : 100;
+      if (!isFinite(desc.min) || !isFinite(desc.max)) {
+        say("min and max must be numbers.", "err");
+        return;
+      }
+      if (desc.min > desc.max) {
+        // The press side swaps inverted bounds before committing, so a
+        // claimed pick with min > max cannot be honest; refuse it. (An
+        // empty span would make the derivation a constant and any
+        // round/nonce "verify".)
+        say("min must not be greater than max.", "err");
+        return;
+      }
+    }
+    document.getElementById("drand-link").innerHTML = "";
+    say("fetching beacon round " + round + "…");
+    fetchRound(round)
+      .then(function(j){
+        if (!j || !j.randomness) throw new Error("that round is not published");
+        var randomness = String(j.randomness);
+        var ready = null;
+        if (type === "list") {
+          ready = fetch("/api/items/" + encodeURIComponent(slug))
+            .then(function(r){ return r.json(); })
+            .then(function(j2){
+              if (!j2 || !j2.items || !j2.items.length) throw new Error("no item list for that slug");
+              desc.items = j2.items;
+            });
+        }
+        return Promise.resolve(ready)
+          .then(function(){ return deriveItem(desc, PALETTE, randomness, nonce, slug, base); })
+          .then(function(computed){
+            if (computed == null) { say("could not recompute a pick from those inputs.", "err"); return; }
+            document.getElementById("drand-link").innerHTML =
+              'randomness source: <a href="' + BEACON_URL + round + '">drand quicknet round ' + round + "</a>";
+            if (computed === item) {
+              say("matches — verified. round " + round + " + this nonce recomputes this exact item." +
+                (via ? " (the chooser draw behind a random random press depends on the presser's pool and is not recomputable here.)" : ""), "ok");
+            } else {
+              say("does not verify — round " + round + " + this nonce computes \\"" + computed + "\\", not \\"" + item + "\\"." +
+                (type === "list" ? " visitor-made lists are rewritten daily; a pick from an earlier day can no longer be recomputed." : ""), "err");
+            }
+          });
+      })
+      .catch(function(e){
+        say("could not verify: " + e.message, "err");
+      });
+  }
+
+  document.getElementById("verify-form").addEventListener("submit", function(ev){
+    ev.preventDefault();
+    run();
+  });
+  if (q.get("slug") && q.get("round") && q.get("nonce") && q.get("item")) run();
+})();
+`;
+
+function verifyPage() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>verify a pick / random choosers</title>
+<meta name="robots" content="noindex">
+<link rel="icon" href="${FAVICON}">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Courier+Prime:wght@400;700&family=Newsreader:opsz,wght@6..72,400;6..72,500&display=swap" rel="stylesheet">
+<style>${CSS}</style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <div class="mark"><a href="/" style="color:inherit;border:0">random<span> choosers</span></a></div>
+    <div class="tagline">press a card, get a thing</div>
+  </header>
+  <div class="verify">
+    <h1>Verify a pick.</h1>
+    <p>Every verified pick commits, together with a one-press nonce, to a drand
+    quicknet round that the gateway had not published yet on the path that
+    press used &mdash; a different anycast backend may already have served it,
+    which is the documented limit of the guarantee. The item is then derived
+    deterministically from the round&rsquo;s randomness, the nonce, the chooser
+    and a draw index &mdash; so this page can recompute it independently,
+    straight from the beacon. Paste the details from a pick, or follow the
+    &ldquo;verified &middot; round N&rdquo; badge under any result, which fills
+    this in for you.</p>
+    <p>Picks from visitor-made choosers verify against the item list as it was
+    at press time. Those lists regenerate daily, so a pick from an earlier day
+    &mdash; or one made around the daily regeneration &mdash; may not
+    recompute. That is an honest mismatch, not proof of rigging.</p>
+    <form id="verify-form">
+      <div class="row">
+        <label>chooser slug <input id="v-slug" autocomplete="off" placeholder="number"></label>
+        <label>beacon round <input id="v-round" inputmode="numeric" autocomplete="off"></label>
+      </div>
+      <label>nonce <input id="v-nonce" autocomplete="off" placeholder="16 hex characters"></label>
+      <label>claimed item <input id="v-item" autocomplete="off"></label>
+      <div class="row">
+        <label>via (optional) <input id="v-via" autocomplete="off" placeholder="random"></label>
+        <label>min (number only) <input id="v-min" inputmode="numeric" autocomplete="off" placeholder="1"></label>
+        <label>max (number only) <input id="v-max" inputmode="numeric" autocomplete="off" placeholder="100"></label>
+      </div>
+      <button class="strike" type="submit">Verify</button>
+    </form>
+    <div id="verdict" class="verdict" aria-live="polite"></div>
+    <div id="drand-link" class="drand-link"></div>
+  </div>
+</div>
+<script>${VERIFY_SCRIPT
+  .replace("__DERIVE_FN__", function () { return DERIVE_FNS_SRC_TEXT; })
+  .replace("__VERIFY_TYPES__", function () { return scriptJson(VERIFY_TYPES); })
   .replace("__SHAPE_COLORS__", function () { return scriptJson(SHAPE_COLORS); })}</script>
 </body>
 </html>`;
@@ -1496,45 +2350,72 @@ export function builtinPick(c) {
 async function handlePick(request, env, ctx, slug) {
   const builtin = BUILTIN_MAP[slug];
 
-  // The meta chooser delegates. Its pool is per-visitor in the browser, but
-  // curl carries no preferences, so the server uses the default: everything
-  // except itself. computePool is the same function the browser runs, so the
-  // two agree on what "everything" means -- including excluding the meta
-  // chooser, which is what stops this from recursing.
+  // Resolve what this press can land on BEFORE committing to a round, so
+  // an unknown slug 404s immediately instead of after a beacon wait.
+  // The meta chooser delegates. Its pool is per-visitor in the browser,
+  // but curl carries no preferences, so the server uses the default:
+  // everything except itself. computePool is the same function the
+  // browser runs, so the two agree on what "everything" means --
+  // including excluding the meta chooser, which stops the recursion.
+  let pool = null;
+  let target = null;
   if (builtin && builtin.type === "meta") {
-    const pool = computePool(buildManifest(await listUserChoosers(env)));
+    pool = computePool(buildManifest(await listUserChoosers(env)));
     if (!pool.length) return json({ error: "nothing to choose from" }, 503);
-    const chosen = pool[randomIndex(pool.length)];
+  } else if (!builtin) {
+    target = await getUserChooser(env, slug);
+    if (!target) return json({ error: "no chooser with that slug" }, 404);
+  }
+
+  // Commit: probe forward to the first round this gateway path will not
+  // serve yet (probeBeaconRound), plus a nonce minted now -- so the
+  // round's signature does not exist on this path when the nonce is
+  // minted, and neither can be ground. A beacon failure (probe error, or
+  // the round still unpublished at the poll cap) degrades to a local
+  // pick with proof: null, never to an error.
+  const nonce = bytesToHex(crypto.getRandomValues(new Uint8Array(8)));
+  const round = await probeBeaconRound(BEACON_URL, fetch);
+  const randomness = round === null ? null : await awaitBeaconRound(round, fetch);
+  const proof = randomness ? { round, nonce } : null;
+
+  // One index per draw -- derived when the beacon answered, crypto
+  // otherwise. Draw indices follow the scheme on deriveItem: meta spends
+  // draw 0 on the pool, so its item draws start at 1.
+  const draw = (drawSlug, drawIx, n) =>
+    randomness ? derivePick(randomness, nonce, drawSlug, drawIx, n) : Promise.resolve(randomIndex(n));
+  const drawItem = (c, drawSlug, base) =>
+    randomness ? deriveItem(c, SHAPE_COLORS, randomness, nonce, drawSlug, base) : Promise.resolve(builtinPick(c));
+
+  if (pool) {
+    const chosen = pool[await draw("random", 0, pool.length)];
     const via = { slug: chosen.slug, name: chosen.name };
     if (chosen.kind === "builtin") {
-      return json({ slug, name: builtin.name, via, item: builtinPick(BUILTIN_MAP[chosen.slug]) });
+      return json({ slug, name: builtin.name, via, item: await drawItem(BUILTIN_MAP[chosen.slug], chosen.slug, 1), proof });
     }
-    // Landing on a visitor-made chooser is a real press against its counter,
-    // exactly as it is in the browser.
-    const target = await getUserChooser(env, chosen.slug);
+    // Landing on a visitor-made chooser is a real press against its
+    // counter, exactly as it is in the browser.
+    target = await getUserChooser(env, chosen.slug);
     if (!target) return json({ error: "no pick: chooser vanished mid-press" }, 404);
-    const item = target.items[randomIndex(target.items.length)];
+    const item = target.items[await draw(chosen.slug, 1, target.items.length)];
     const count = await hitCounter(env, chosen.slug);
     if (target.listDay !== utcDay() && ctx && typeof ctx.waitUntil === "function") {
       ctx.waitUntil(refreshList(env, chosen.slug, target.name));
     }
-    return json({ slug, name: builtin.name, via, item, count });
+    return json({ slug, name: builtin.name, via, item, count, proof });
   }
 
   // Built-ins have no counters, so no hitCounter call and no count field.
-  if (builtin) return json({ slug, name: builtin.name, item: builtinPick(builtin) });
+  if (builtin) return json({ slug, name: builtin.name, item: await drawItem(builtin, slug, 0), proof });
 
-  const rec = await getUserChooser(env, slug);
-  if (!rec) return json({ error: "no chooser with that slug" }, 404);
-  const item = rec.items[randomIndex(rec.items.length)];
+  const item = target.items[await draw(slug, 0, target.items.length)];
   const count = await hitCounter(env, slug);
 
   // Stale list? Regenerate in the background; the press returns now.
-  if (rec.listDay !== utcDay() && ctx && typeof ctx.waitUntil === "function") {
-    ctx.waitUntil(refreshList(env, slug, rec.name));
+  if (target.listDay !== utcDay() && ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(refreshList(env, slug, target.name));
   }
 
-  return json({ slug, name: rec.name, item, count });
+  return json({ slug, name: target.name, item, count, proof });
 }
 
 export default {
@@ -1565,6 +2446,17 @@ export default {
         ]);
       }
 
+      if (path.startsWith("/api/items/")) {
+        // The item list a /verify recomputation draws from. Works for the
+        // list built-ins too, so the verifier needs no inlined copy.
+        const slug = decodeURIComponent(path.split("/").pop() || "").toLowerCase();
+        const rec = BUILTIN_MAP[slug] || (await getUserChooser(env, slug));
+        if (!rec || !Array.isArray(rec.items) || !rec.items.length) {
+          return json({ error: "no item list for that slug" }, 404);
+        }
+        return json({ slug, items: rec.items });
+      }
+
       /* Social preview -------------------------------------------- */
 
       if (path === "/social.png") {
@@ -1577,6 +2469,12 @@ export default {
             ...CORS,
           },
         });
+      }
+
+      /* Verify page ------------------------------------------------- */
+
+      if (path === "/verify") {
+        return html(verifyPage(), 200, { "cache-control": "no-store" });
       }
 
       /* Permalink ------------------------------------------------- */

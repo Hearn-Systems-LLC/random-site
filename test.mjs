@@ -1,5 +1,20 @@
 import { readFileSync } from "node:fs";
-import worker, { BUILTINS, Counters, slugify, computePool, builtinPick, SHAPE_COLORS } from "./src/worker.js";
+import worker, {
+  BUILTINS,
+  Counters,
+  SHAPE_COLORS,
+  slugify,
+  computePool,
+  builtinPick,
+  derivePick,
+  deriveItem,
+  beaconRoundForTime,
+  beaconPublishTime,
+  awaitBeaconRound,
+  probeBeaconRound,
+  beaconTiming,
+  deriveFnsSrc,
+} from "./src/worker.js";
 
 /* ------------------------------------------------------------------ *
  * Mocks. No network, no wrangler: KV is a Map, the Counters DO is a
@@ -120,6 +135,59 @@ async function sha256Hex(s) {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+/* Beacon stub. The ONLY network the worker may attempt under test is the
+   drand beacon (Turnstile is bypassed because TURNSTILE_SECRET is unset);
+   anything else throws, so a regression that adds a network call fails
+   loudly. The stub models the probe-forward world: /public/latest answers
+   beaconLatest, rounds <= beaconHorizon are served, rounds beyond 404 on
+   first sight and "publish" on the next fetch (the press's poll). "down"
+   simulates an unreachable beacon; a round in beaconHold 404s until
+   released, which exercises the poll-timeout path. Poll and probe URLs
+   carry cache-busting "?p=" queries, stripped here. */
+const BEACON_PREFIX =
+  "https://drand.cloudflare.com/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971/public/";
+let beaconMode = "healthy";
+let beaconLatest = 0;
+let beaconHorizon = 0;
+const beaconAttempts = new Map();
+const beaconHold = new Set();
+const beaconRandomnessCache = new Map();
+async function beaconRandomness(round) {
+  if (!beaconRandomnessCache.has(round)) {
+    beaconRandomnessCache.set(round, await sha256Hex("stub-beacon:" + round));
+  }
+  return beaconRandomnessCache.get(round);
+}
+// A freshly-seeded healthy beacon: latest L, horizon L+2, so a probe
+// walks two 200s and commits L+3.
+function seedBeacon(latest) {
+  beaconLatest = latest;
+  beaconHorizon = latest + 2;
+  beaconAttempts.clear();
+  beaconHold.clear();
+}
+globalThis.fetch = async (url) => {
+  const u = String(url);
+  if (!u.startsWith(BEACON_PREFIX)) throw new Error("unexpected fetch in tests: " + u);
+  if (beaconMode === "down") throw new Error("beacon unreachable (stub)");
+  const rest = u.slice(BEACON_PREFIX.length).split("?")[0];
+  if (rest === "latest") {
+    return Response.json({ round: beaconLatest, randomness: await beaconRandomness(beaconLatest), signature: "stub" });
+  }
+  const round = Number(rest);
+  if (beaconHold.has(round)) return new Response("not found", { status: 404 });
+  if (round <= beaconHorizon) {
+    return Response.json({ round, randomness: await beaconRandomness(round), signature: "stub" });
+  }
+  // Beyond the horizon: 404 the first time, publish on the next fetch.
+  const n = (beaconAttempts.get(round) || 0) + 1;
+  beaconAttempts.set(round, n);
+  if (n < 2) return new Response("not found", { status: 404 });
+  seedBeacon(round); // the chain moved: latest = round, horizon = round + 2
+  return Response.json({ round, randomness: await beaconRandomness(round), signature: "stub" });
+};
+seedBeacon(500000);
 
 const today = new Date().toISOString().slice(0, 10);
 
@@ -719,6 +787,530 @@ check("no __SHAPE_COLORS__ placeholder left", !shapeHtml.includes("__SHAPE_COLOR
 check("palette inlined for the client", shapeHtml.includes(JSON.stringify(SHAPE_COLORS)), SHAPE_COLORS.join(","));
 check("palette is not duplicated in the client script",
   (shapeHtml.match(/#8FA876/g) || []).length === 1, (shapeHtml.match(/#8FA876/g) || []).length);
+
+/* 22. beacon round math ------------------------------------------------ */
+check("round at genesis is 1", beaconRoundForTime(1692803367 * 1000) === 1);
+check("round holds within its window", beaconRoundForTime(1692803367 * 1000 + 2999) === 1);
+check("round advances at the window boundary", beaconRoundForTime((1692803367 + 3) * 1000) === 2);
+check("round 1 publishes at genesis", beaconPublishTime(1) === 1692803367);
+check("publish times are one period apart", beaconPublishTime(42) - beaconPublishTime(41) === 3);
+// Commit contract: the committed round belongs to the 3s window starting
+// now, so its nominal publish instant is never more than a period away.
+const tNow = Date.now();
+const tPub = beaconPublishTime(beaconRoundForTime(tNow)) * 1000;
+check("committed round is the current window", tPub <= tNow + 1000 && tPub > tNow - 3000, (tPub - tNow) + "ms");
+// The poll cadence the amended spec fixes: ~1s interval, ~18s cap.
+check("poll cadence is ~1s with an ~18s cap", beaconTiming.intervalMs === 1000 && beaconTiming.capMs === 18000, JSON.stringify(beaconTiming));
+
+/* 23. derivePick: vectors, bounds, uniformity --------------------------- */
+// Vectors generated once from an independent implementation of the spec
+// formula (seed = sha256hex(randomness + ":" + nonce + ":" + slug + ":"
+// + drawIx), walked as eight uint32s with rejection sampling); they lock
+// the algorithm against accidental drift.
+const V_RAND = "f574f1b169399f705cc2cd7e2a222eca506cedb7a563109e26592f91cc1c2bba";
+const V_NONCE = "0123456789abcdef";
+check("derivePick vector: number", (await derivePick(V_RAND, V_NONCE, "number", 0, 100)) === 11, await derivePick(V_RAND, V_NONCE, "number", 0, 100));
+check("derivePick vector: list", (await derivePick(V_RAND, V_NONCE, "animal", 0, 72)) === 70);
+check("derivePick vector: meta pool", (await derivePick(V_RAND, V_NONCE, "random", 0, 5)) === 1);
+check("derivePick vector: meta item draw", (await derivePick(V_RAND, V_NONCE, "animal", 1, 72)) === 24);
+const varied = new Set();
+for (let i = 0; i < 40; i++) varied.add(await derivePick(V_RAND, "nonce" + i, "number", 0, 100));
+check("derivePick varies with the nonce", varied.size > 10, varied.size);
+const buckets = new Array(10).fill(0);
+for (let i = 0; i < 500; i++) buckets[await derivePick(V_RAND, "u" + i, "color", 0, 10)]++;
+check("derivePick draws all 500", buckets.reduce((a, b) => a + b, 0) === 500);
+check("derivePick is roughly uniform", buckets.every((c) => c > 20 && c < 90), buckets.join(","));
+check("derivePick n=1 is always 0", (await derivePick(V_RAND, V_NONCE, "number", 0, 1)) === 0);
+check("derivePick rejects n > 2^32", (await derivePick(V_RAND, V_NONCE, "number", 0, 4294967297)) === null);
+
+/* 24. deriveItem: the per-type draw scheme ------------------------------ */
+check("deriveItem number", (await deriveItem({ type: "number" }, SHAPE_COLORS, V_RAND, V_NONCE, "number", 0)) === "12");
+check(
+  "deriveItem number honors bounds",
+  (await deriveItem({ type: "number", min: 5, max: 8 }, SHAPE_COLORS, V_RAND, V_NONCE, "number", 0)) ===
+    String(5 + (await derivePick(V_RAND, V_NONCE, "number", 0, 4)))
+);
+check("deriveItem color", (await deriveItem({ type: "color" }, SHAPE_COLORS, V_RAND, V_NONCE, "color", 0)) === "#5fffca");
+check("deriveItem shape", (await deriveItem({ type: "shape" }, SHAPE_COLORS, V_RAND, V_NONCE, "shape", 0)) === "a 7-sided polygon in #5E8CA8, filled");
+check("deriveItem list", (await deriveItem({ type: "list", items: animal.items }, SHAPE_COLORS, V_RAND, V_NONCE, "animal", 0)) === "wombat");
+check("deriveItem meta item uses base 1", (await deriveItem({ type: "list", items: animal.items }, SHAPE_COLORS, V_RAND, V_NONCE, "animal", 1)) === "gazelle");
+check(
+  "deriveItem color via meta starts at draw 1",
+  (await deriveItem({ type: "color" }, SHAPE_COLORS, V_RAND, V_NONCE, "color", 1)) ===
+    "#" + (await Promise.all([1, 2, 3, 4, 5, 6].map((d) => derivePick(V_RAND, V_NONCE, "color", d, 16)))).map((i) => "0123456789abcdef"[i]).join("")
+);
+
+/* 25. shipped derivation matches the server's byte-for-byte ------------- */
+const eqHome = await (await worker.fetch(req("/", { headers: { accept: "text/html" } }), env, ctx)).text();
+check("home leaves no __DERIVE_FN__ placeholder", !eqHome.includes("__DERIVE_FN__"));
+check("home leaves no cadence placeholders", !eqHome.includes("__BEACON_CAP_MS__") && !eqHome.includes("__BEACON_INTERVAL_MS__"));
+check("client cadence is injected from beaconTiming", eqHome.includes("var BEACON_CAP_MS = 18000;") && eqHome.includes("var BEACON_INTERVAL_MS = 1000;"));
+check("round math stays module-side", !eqHome.includes("function beaconRoundForTime(") && !eqHome.includes("function beaconPublishTime("));
+check("home inlines derivePick source", eqHome.includes("function derivePick(randomness, nonce, slug, drawIx, n)"));
+check("home inlines the probe", eqHome.includes("function probeBeaconRound(baseUrl, fetchImpl)"));
+// 2026-07-29 regression: esbuild (wrangler dev AND deploy) rewrites
+// nested function declarations with its keepNames __name helper, which
+// does not exist in the browser -- toString injection shipped it and
+// every press died on "Uncaught ReferenceError: __name is not defined".
+// The bundle is a string literal now, and these two checks keep it that
+// way: byte-identical to the module sources, free of bundler helpers.
+check(
+  "injected bundle is byte-identical to module sources",
+  deriveFnsSrc() === [derivePick, deriveItem, probeBeaconRound].map((f) => f.toString()).join("\n")
+);
+check("shipped home carries no bundler helpers", !eqHome.includes("__name(") && !deriveFnsSrc().includes("__name"));
+check("client shows the pending state", eqHome.includes("awaiting beacon") && eqHome.includes('" round "'));
+check("client renders the verified badge", eqHome.includes("verified &middot; round"));
+check("cards carry a proof slot", eqHome.includes('class="proof"'));
+check("footer links to /verify", eqHome.includes('href="/verify"'));
+const eqScript = eqHome.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/)[1];
+const clientDerive = new Function(
+  sliceFn(eqScript, "derivePick") + "\n" + sliceFn(eqScript, "deriveItem") +
+  "\nreturn { derivePick: derivePick, deriveItem: deriveItem };"
+)();
+check("client derivePick matches server", (await clientDerive.derivePick(V_RAND, V_NONCE, "number", 0, 100)) === 11);
+check(
+  "client deriveItem matches server (shape)",
+  (await clientDerive.deriveItem({ type: "shape" }, SHAPE_COLORS, V_RAND, V_NONCE, "shape", 0)) ===
+    (await deriveItem({ type: "shape" }, SHAPE_COLORS, V_RAND, V_NONCE, "shape", 0))
+);
+check("client deriveItem matches server (color)", (await clientDerive.deriveItem({ type: "color" }, SHAPE_COLORS, V_RAND, V_NONCE, "color", 0)) === "#5fffca");
+
+/* 26. API picks carry recomputable proof (beacon healthy) ---------------- */
+beaconMode = "healthy";
+seedBeacon(500000);
+const jProofNum = await (await post("number")).json();
+check(
+  "number pick carries proof",
+  !!(jProofNum.proof && typeof jProofNum.proof.round === "number" && /^[0-9a-f]{16}$/.test(jProofNum.proof.nonce)),
+  JSON.stringify(jProofNum.proof)
+);
+// Probe-forward commit: the target is the first round the stub would not
+// serve at commit time -- horizon+1 = latest+3 in the seeded state.
+check("commit is the first unserved round", jProofNum.proof.round === 500003, jProofNum.proof.round);
+check(
+  "number pick recomputes from its proof",
+  (await deriveItem({ type: "number" }, SHAPE_COLORS, await beaconRandomness(jProofNum.proof.round), jProofNum.proof.nonce, "number", 0)) === jProofNum.item
+);
+const jProofColor = await (await post("color")).json();
+check(
+  "color pick recomputes from its proof",
+  (await deriveItem({ type: "color" }, SHAPE_COLORS, await beaconRandomness(jProofColor.proof.round), jProofColor.proof.nonce, "color", 0)) === jProofColor.item,
+  jProofColor.item
+);
+const jProofAnimal = await (await post("animal")).json();
+check(
+  "list pick recomputes from its proof",
+  (await deriveItem({ type: "list", items: animal.items }, SHAPE_COLORS, await beaconRandomness(jProofAnimal.proof.round), jProofAnimal.proof.nonce, "animal", 0)) === jProofAnimal.item
+);
+const jProofUser = await (await post("random-dinosaur")).json();
+const dinoRec = JSON.parse(kv.get("c:random-dinosaur"));
+check(
+  "user pick recomputes from its proof",
+  (await deriveItem({ type: "list", items: dinoRec.items }, SHAPE_COLORS, await beaconRandomness(jProofUser.proof.round), jProofUser.proof.nonce, "random-dinosaur", 0)) === jProofUser.item
+);
+// Locks the badge rule the meta->user path depends on: a direct pick (which
+// is what the browser's delegation POSTs) is derived at base 0 and its
+// response carries NO via -- so the badge must not add one either.
+check("direct user pick carries no via field", !("via" in jProofUser), JSON.stringify(Object.keys(jProofUser)));
+check("user pick still counts", typeof jProofUser.count === "number", jProofUser.count);
+
+// The meta pick: pool draw 0 chooses the chooser, item draws start at 1.
+const jProofMeta = await (await post("random")).json();
+check("meta pick carries proof and via", !!(jProofMeta.proof && jProofMeta.via && jProofMeta.via.slug));
+const metaUsers = [...kv.keys()]
+  .filter((k) => k.startsWith("c:"))
+  .map((k) => JSON.parse(kv.get(k)))
+  .sort((a, b) => String(a.created || "").localeCompare(String(b.created || "")));
+const metaManifest = BUILTINS.map((b) => ({ slug: b.slug, name: b.name, kind: b.kind, type: b.type }))
+  .concat(metaUsers.map((u) => ({ slug: u.slug, name: u.name, kind: u.kind, type: u.type })));
+const metaPool = computePool(metaManifest);
+const metaRand = await beaconRandomness(jProofMeta.proof.round);
+const poolIdx = await derivePick(metaRand, jProofMeta.proof.nonce, "random", 0, metaPool.length);
+check(
+  "meta pool draw recomputes the delegation",
+  !!(metaPool[poolIdx] && metaPool[poolIdx].slug === jProofMeta.via.slug),
+  poolIdx + " -> " + ((metaPool[poolIdx] || {}).slug) + " vs " + jProofMeta.via.slug
+);
+const metaChosen = BUILTINS.find((b) => b.slug === jProofMeta.via.slug);
+const metaDesc = metaChosen
+  ? metaChosen.type === "list"
+    ? { type: "list", items: metaChosen.items }
+    : { type: metaChosen.type }
+  : { type: "list", items: JSON.parse(kv.get("c:" + jProofMeta.via.slug)).items };
+check(
+  "meta item recomputes at base 1",
+  (await deriveItem(metaDesc, SHAPE_COLORS, metaRand, jProofMeta.proof.nonce, jProofMeta.via.slug, 1)) === jProofMeta.item,
+  jProofMeta.item
+);
+
+/* 27. beacon down: fallback picks, badged, API proof null ---------------- */
+beaconMode = "down";
+const savedTiming = { ...beaconTiming };
+beaconTiming.intervalMs = 1;
+beaconTiming.capMs = 40;
+const jFbNum = await (await post("number")).json();
+check("fallback number pick has proof null", jFbNum.proof === null, JSON.stringify(jFbNum.proof));
+const fbNum = Number(jFbNum.item);
+check("fallback number pick still valid", Number.isInteger(fbNum) && fbNum >= 1 && fbNum <= 100, jFbNum.item);
+const jFbUser = await (await post("random-dinosaur")).json();
+check("fallback user pick has proof null", jFbUser.proof === null);
+check("fallback user pick still from the list", dinoRec.items.includes(jFbUser.item), jFbUser.item);
+check("fallback user pick still counts", typeof jFbUser.count === "number");
+const jFbMeta = await (await post("random")).json();
+check("fallback meta pick has proof null", jFbMeta.proof === null);
+check("fallback meta pick still delegates", !!(jFbMeta.via && jFbMeta.via.slug && typeof jFbMeta.item === "string"));
+beaconMode = "healthy";
+Object.assign(beaconTiming, savedTiming);
+check("beacon recovers after fallback", (await (await post("number")).json()).proof !== null);
+
+/* 28. awaitBeaconRound polling ------------------------------------------- */
+beaconTiming.intervalMs = 1;
+beaconTiming.capMs = 500;
+let pollCalls = 0;
+const flaky = async () => {
+  pollCalls++;
+  if (pollCalls < 3) return new Response("not found", { status: 404 });
+  return Response.json({ round: 7, randomness: "ab".repeat(32) });
+};
+check("poller waits out 404s", (await awaitBeaconRound(7, flaky)) === "ab".repeat(32));
+check("poller retried until publication", pollCalls === 3, pollCalls);
+const throwing = async () => { throw new Error("network dead"); };
+check("poller caps out to null on a dead beacon", (await awaitBeaconRound(7, throwing)) === null);
+// A held round through the global stub follows the path handlePick uses.
+// The wrapper must be installed before awaitBeaconRound is called: it
+// binds the default fetch at invocation time.
+beaconHold.add(424242);
+let releaseCalls = 0;
+const stubFetch = globalThis.fetch;
+globalThis.fetch = async (u) => {
+  releaseCalls++;
+  if (releaseCalls >= 4) beaconHold.delete(424242);
+  return stubFetch(u);
+};
+check("poller returns once the round publishes", (await awaitBeaconRound(424242)) === (await beaconRandomness(424242)));
+globalThis.fetch = stubFetch;
+Object.assign(beaconTiming, savedTiming);
+
+/* 28b. probe-forward commit --------------------------------------------- */
+beaconMode = "healthy";
+// Happy path: latest L, horizon L+2 -> walk two 200s, commit L+3.
+seedBeacon(700000);
+check("probe commits to the first unserved round", (await probeBeaconRound(BEACON_PREFIX, fetch)) === 700003);
+// A second probe of the same state has advanced: the first probe's 404
+// plus this probe's re-fetch "published" 700003, so the walk continues.
+check(
+  "probe advances past rounds published in between",
+  (await probeBeaconRound(BEACON_PREFIX, fetch)) > 700003
+);
+// Badly stale /public/latest: every walk probe 200s, the walk is bounded
+// at 10, and the commit is the last probed round + 1.
+seedBeacon(700100);
+beaconHorizon = 700199; // 99 rounds ahead of latest
+beaconAttempts.clear();
+check("stale latest: bounded walk commits last-probed + 1", (await probeBeaconRound(BEACON_PREFIX, fetch)) === 700111);
+// The probe itself erroring goes straight to the fallback.
+beaconMode = "down";
+check("probe network error yields null", (await probeBeaconRound(BEACON_PREFIX, fetch)) === null);
+const jProbeDown = await (await post("number")).json();
+check("probe failure falls back with proof null", jProbeDown.proof === null);
+check("probe failure still returns a valid pick", Number(jProbeDown.item) >= 1 && Number(jProbeDown.item) <= 100, jProbeDown.item);
+beaconMode = "healthy";
+// A seed fetch that never settles (blackholed connection — content
+// blocker, VPN, filtered DNS dropping the request) must time out into
+// the fallback, not pin the press on "awaiting beacon" forever.
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = () => new Promise(() => {});
+  const t0 = Date.now();
+  const hung = await probeBeaconRound(BEACON_PREFIX, fetch);
+  const hungMs = Date.now() - t0;
+  globalThis.fetch = realFetch;
+  check("blackholed beacon seed times out to null", hung === null);
+  check("blackholed seed respects the ~6s backstop", hungMs >= 5900 && hungMs < 9000, hungMs + "ms");
+}
+// Committed round that never publishes: poll cap -> fallback.
+seedBeacon(700200);
+beaconHold.add(700203); // the round the probe will commit to
+beaconTiming.intervalMs = 1;
+beaconTiming.capMs = 40;
+const jTimeout = await (await post("number")).json();
+check("unpublished-at-cap falls back with proof null", jTimeout.proof === null);
+check("unpublished-at-cap still returns a valid pick", Number(jTimeout.item) >= 1 && Number(jTimeout.item) <= 100, jTimeout.item);
+beaconTiming.intervalMs = 1000;
+beaconTiming.capMs = 18000;
+seedBeacon(700300);
+
+/* 29. /verify page and /api/items ---------------------------------------- */
+const rVerify = await worker.fetch(req("/verify", { headers: { accept: "text/html" } }), env, ctx);
+const verifyHtml = await rVerify.text();
+check("/verify returns 200 HTML", rVerify.status === 200 && verifyHtml.startsWith("<!doctype html>"));
+check("/verify has the form", verifyHtml.includes('id="verify-form"') && verifyHtml.includes('id="v-slug"') && verifyHtml.includes('id="v-item"'));
+check("/verify leaves no placeholders", !verifyHtml.includes("__DERIVE_FN__") && !verifyHtml.includes("__VERIFY_TYPES__") && !verifyHtml.includes("__SHAPE_COLORS__"));
+check(
+  "/verify inlines the derivation",
+  verifyHtml.includes("function derivePick(randomness, nonce, slug, drawIx, n)") &&
+    verifyHtml.includes("function deriveItem(c, palette, randomness, nonce, slug, base)")
+);
+check("/verify inlines the type map", verifyHtml.includes('"simpsons-character":"list"') && verifyHtml.includes('"random":"meta"'));
+check("/verify points at the beacon", verifyHtml.includes("https://drand.cloudflare.com/"));
+check("/verify honors the no-template-literal invariant", !verifyHtml.includes("`${"));
+const verifyScript = verifyHtml.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
+let verifyParses = "no script";
+if (verifyScript) {
+  try {
+    new Function(verifyScript[1]);
+    verifyParses = true;
+  } catch (e) {
+    verifyParses = e.message;
+  }
+}
+check("verify script parses", verifyParses === true, verifyParses);
+
+const rItems = await worker.fetch(req("/api/items/animal"), env, ctx);
+const jItems = await rItems.json();
+check("/api/items serves a built-in list", rItems.status === 200 && jItems.items.length === animal.items.length);
+const rItemsUser = await worker.fetch(req("/api/items/random-dinosaur"), env, ctx);
+check("/api/items serves a user list", (await rItemsUser.json()).items.length === dinoRec.items.length);
+check("/api/items 404s unknown slugs", (await worker.fetch(req("/api/items/nope"), env, ctx)).status === 404);
+check("/api/items 404s choosers without lists", (await worker.fetch(req("/api/items/number"), env, ctx)).status === 404);
+
+/* 30. browser fallback paths, executed from the shipped script ------------ */
+// clientRuntime evals functions extracted from a shipped <script> with stub
+// globals, so the tests run the exact source the browser runs.
+function clientRuntime(scriptSrc, names, globals) {
+  const src = names
+    .map((n) => {
+      const s = sliceFn(scriptSrc, n);
+      if (!s) throw new Error("client fn not found in shipped script: " + n);
+      return s;
+    })
+    .join("\n");
+  const keys = Object.keys(globals);
+  const factory = new Function(...keys, src + "\nreturn { " + names.map((n) => n + ": " + n).join(", ") + " };");
+  return factory(...keys.map((k) => globals[k]));
+}
+
+function stubPressCard(type, withBounds) {
+  const proof = { innerHTML: "" };
+  const firstChild = { textContent: "" };
+  const result = { className: "", innerHTML: "", firstChild };
+  const err = { hidden: true, textContent: "" };
+  const minIn = { value: "-1000000000000" };
+  const maxIn = { value: "1000000000000" };
+  return {
+    proof, result, err, firstChild,
+    getAttribute: (a) => (a === "data-type" ? type : null),
+    querySelector: (sel) =>
+      sel === ".proof" ? proof :
+      sel === ".result" ? result :
+      sel === ".card-err" ? err :
+      sel === ".num-min" ? (withBounds ? minIn : null) :
+      sel === ".num-max" ? (withBounds ? maxIn : null) : null,
+  };
+}
+
+const boom = (name) => () => { throw new Error(name + " must not be called on this path"); };
+const CLIENT_FNS = [
+  "rand", "randInt", "pick", "scramble", "resultEl", "errEl", "showErr",
+  "proofEl", "clearProof", "showProof", "pendingBeacon", "textResult", "numberBounds",
+  "pressNumber", "pressList", "localBuiltin", "pressVerified",
+];
+const rtA = clientRuntime(eqScript, CLIENT_FNS, {
+  LISTS: {}, SHAPE_COLORS, HEX: "0123456789abcdef", reduce: true,
+  probeBeaconRound: boom("probeBeaconRound"), fetchBeacon: boom("fetchBeacon"),
+  deriveItem: boom("deriveItem"), mintNonce: function () { return "0123456789abcdef"; },
+  BEACON_URL: "about:blank", fetch: boom("fetch"),
+});
+
+// Fallback badge: a null proof is always a visible "unverified".
+const fbCard = stubPressCard("number", false);
+rtA.showProof(fbCard, null);
+check("fallback badges unverified", fbCard.proof.innerHTML.includes("unverified"), fbCard.proof.innerHTML);
+
+// Span wider than 2^32: early-out with a local pick and an unverified
+// badge, before the button is ever disabled or the beacon touched (the
+// boom globals above fire if the flow reaches the probe).
+const wideCard = stubPressCard("number", true);
+const wideBtn = { disabled: false };
+rtA.pressVerified(wideCard, "number", wideBtn);
+check("span > 2^32 renders a local pick", wideCard.firstChild.textContent !== "", wideCard.firstChild.textContent);
+check("span > 2^32 badges unverified", wideCard.proof.innerHTML.includes("unverified"));
+check("span > 2^32 never disabled the button", wideBtn.disabled === false);
+
+// 2026-07-29 regression: the probe used to be called at the raw head of
+// the promise chain, so a SYNCHRONOUS throw there (boom below stands in
+// for the esbuild __name ReferenceError) escaped every catch and pinned
+// the card on "awaiting beacon" forever. The wrapped head must convert
+// it into the fallback: local pick, unverified badge, button recovered.
+const throwCard = stubPressCard("number", false);
+const throwBtn = { disabled: false };
+rtA.pressVerified(throwCard, "number", throwBtn);
+await new Promise(function (r) { setTimeout(r, 0); });
+check("sync-throwing probe falls back to a local pick", throwCard.firstChild.textContent !== "", throwCard.firstChild.textContent);
+check("sync-throwing probe badges unverified", throwCard.proof.innerHTML.includes("unverified"), throwCard.proof.innerHTML);
+check("sync-throwing probe re-enables the button", throwBtn.disabled === false);
+
+// Meta finish-with-null (beacon down mid-press): local pick + unverified.
+const metaCard = stubPressCard("meta", false);
+const viaEl = { textContent: "" };
+const rtF = clientRuntime(eqScript, ["finish", "localBuiltin", "pressNumber", "numberBounds", "textResult", "scramble", "resultEl", "errEl", "showErr", "proofEl", "clearProof", "showProof", "rand", "randInt", "pick"], {
+  viaEl, card: metaCard, LISTS: {}, SHAPE_COLORS, HEX: "0123456789abcdef", reduce: true,
+  deriveItem: async () => null, pressKv: async () => true,
+});
+rtF.finish({ kind: "builtin", type: "number", slug: "number", name: "number" }, null);
+check("meta fallback sets the via line", viaEl.textContent === "via number", viaEl.textContent);
+check("meta fallback badges unverified", metaCard.proof.innerHTML.includes("unverified"));
+// ...and the derived-but-null path (empty list defense) does the same.
+const metaCard2 = stubPressCard("meta", false);
+const rtF2 = clientRuntime(eqScript, ["finish", "localBuiltin", "pressNumber", "numberBounds", "textResult", "scramble", "resultEl", "errEl", "showErr", "proofEl", "clearProof", "showProof", "rand", "randInt", "pick"], {
+  viaEl: { textContent: "" }, card: metaCard2, LISTS: {}, SHAPE_COLORS, HEX: "0123456789abcdef", reduce: true,
+  deriveItem: async () => null, pressKv: async () => true,
+});
+await rtF2.finish(
+  { kind: "builtin", type: "number", slug: "number", name: "number" },
+  { round: 1, nonce: "ab", randomness: "cd" }
+);
+check("meta null-item defense badges unverified", metaCard2.proof.innerHTML.includes("unverified"));
+
+/* 31. badge URL rules ------------------------------------------------------ */
+function badgeHref(card, proof) {
+  rtA.showProof(card, proof);
+  const m = card.proof.innerHTML.match(/href="([^"]+)"/);
+  return m ? m[1] : null;
+}
+const urlDefault = badgeHref(stubPressCard("number", false), { slug: "number", round: 777, nonce: "ab", item: "42" });
+check("badge without bounds omits min/max", !!urlDefault && !urlDefault.includes("min="), urlDefault);
+const urlDefaultExplicit = badgeHref(stubPressCard("number", false), { slug: "number", round: 777, nonce: "ab", item: "42", min: 1, max: 100 });
+check("badge with 1/100 omits min/max", !!urlDefaultExplicit && !urlDefaultExplicit.includes("min="), urlDefaultExplicit);
+const urlCustom = badgeHref(stubPressCard("number", false), { slug: "number", round: 777, nonce: "ab", item: "6", min: 5, max: 8 });
+check("badge with custom bounds carries min/max", !!urlCustom && urlCustom.includes("&min=5&max=8"), urlCustom);
+const urlVia = badgeHref(stubPressCard("number", false), { slug: "animal", round: 777, nonce: "ab", item: "wombat", via: "random" });
+check("meta badge carries via", !!urlVia && urlVia.includes("&via=random"), urlVia);
+const urlNoVia = badgeHref(stubPressCard("number", false), { slug: "random-dinosaur", round: 777, nonce: "ab", item: "Raptor" });
+check("direct-pick badge has no via (recomputes at base 0)", !!urlNoVia && !urlNoVia.includes("via="), urlNoVia);
+// A hostile round value must never reach innerHTML raw.
+const evilCard = stubPressCard("number", false);
+rtA.showProof(evilCard, { slug: "number", round: '<img src=x onerror=alert(1)>', nonce: "ab", item: "42" });
+check("hostile round coerced to unverified badge", evilCard.proof.innerHTML.includes("unverified") && !evilCard.proof.innerHTML.includes("<img"), evilCard.proof.innerHTML);
+const strRound = badgeHref(stubPressCard("number", false), { slug: "number", round: "777", nonce: "ab", item: "42" });
+check("string round coerces cleanly", !!strRound && strRound.includes("round=777"), strRound);
+
+/* 32. /verify script logic, executed from the shipped page ----------------- */
+const TYPES_MAP = Object.fromEntries(BUILTINS.map((b) => [b.slug, b.type]));
+function verifyDom(fields) {
+  const verdict = { className: "verdict", textContent: "" };
+  const link = { innerHTML: "" };
+  const els = {};
+  for (const k of ["slug", "round", "nonce", "item", "via", "min", "max"]) {
+    els["v-" + k] = { value: fields[k] !== undefined ? fields[k] : "" };
+  }
+  return {
+    verdict, link,
+    doc: {
+      getElementById: (id) => (id === "verdict" ? verdict : id === "drand-link" ? link : els[id] || null),
+    },
+  };
+}
+function mkVerifyFetch(log, { randomness, items = {}, beacon404s = 0 }) {
+  let beaconCalls = 0;
+  const f = async (url) => {
+    const u = String(url);
+    log.push(u);
+    if (u.startsWith(BEACON_PREFIX)) {
+      beaconCalls++;
+      if (beaconCalls <= beacon404s) return new Response("not found", { status: 404 });
+      return Response.json({ round: 777, randomness });
+    }
+    if (u.startsWith("/api/items/")) {
+      const slug = decodeURIComponent(u.split("/").pop());
+      const list = items[slug];
+      return Response.json(list ? { slug, items: list } : { error: "no item list for that slug" }, { status: list ? 200 : 404 });
+    }
+    throw new Error("unexpected verify fetch: " + u);
+  };
+  f.beaconCalls = () => beaconCalls;
+  return f;
+}
+function verifyRuntime(dom, fetchImpl) {
+  return clientRuntime(verifyScript[1], ["el", "say", "sleepVerify", "fetchRound", "run"], {
+    document: dom.doc, TYPES: TYPES_MAP, PALETTE: SHAPE_COLORS,
+    deriveItem, fetch: fetchImpl, BEACON_URL: BEACON_PREFIX,
+  });
+}
+async function runVerify(fields, fetchImpl) {
+  const dom = verifyDom(fields);
+  const rt = verifyRuntime(dom, fetchImpl);
+  rt.run();
+  const t0 = Date.now();
+  while (!/\b(ok|err)\b/.test(dom.verdict.className)) {
+    if (Date.now() - t0 > 8000) throw new Error("verify run timed out; verdict: " + dom.verdict.textContent);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return dom;
+}
+
+// via present -> item draws at base 1: an item computed at base 1 verifies,
+// and the same inputs without via do not.
+const viaItem = await deriveItem({ type: "list", items: animal.items }, SHAPE_COLORS, V_RAND, V_NONCE, "animal", 1);
+const viaLog = [];
+const viaDom = await runVerify(
+  { slug: "animal", round: "777", nonce: V_NONCE, item: viaItem, via: "random" },
+  mkVerifyFetch(viaLog, { randomness: V_RAND, items: { animal: animal.items } })
+);
+check("verify: via pick matches at base 1", viaDom.verdict.className.includes("ok") && viaDom.verdict.textContent.includes("matches"), viaDom.verdict.textContent);
+check("verify: beacon fetch is cache-busted", viaLog.some((u) => u.includes("?v=777-")), viaLog[0]);
+const noViaDom = await runVerify(
+  { slug: "animal", round: "777", nonce: V_NONCE, item: viaItem, via: "" },
+  mkVerifyFetch([], { randomness: V_RAND, items: { animal: animal.items } })
+);
+check("verify: same pick without via mismatches", noViaDom.verdict.className.includes("err") && noViaDom.verdict.textContent.includes("does not verify"), noViaDom.verdict.textContent);
+
+// Inverted bounds are refused before any fetch (an empty span would make
+// the derivation a constant and any round/nonce "verify").
+const invLog = [];
+const invDom = await runVerify(
+  { slug: "number", round: "777", nonce: V_NONCE, item: "50", min: "100", max: "1" },
+  mkVerifyFetch(invLog, { randomness: V_RAND })
+);
+check("verify: inverted bounds rejected", invDom.verdict.className.includes("err") && invDom.verdict.textContent.includes("min must not be greater than max"), invDom.verdict.textContent);
+check("verify: inverted bounds rejected before fetching", invLog.length === 0, invLog.join(","));
+
+// Unknown slug falls back to the list scheme and fetches its items.
+const dinoItems = ["Raptor", "T-Rex", "Stegosaurus", "Triceratops", "Ankylosaurus", "Brontosaurus", "Pterodactyl", "Mosasaurus"];
+const dinoItem = await deriveItem({ type: "list", items: dinoItems }, SHAPE_COLORS, V_RAND, V_NONCE, "dino", 0);
+const dinoLog = [];
+const dinoDom = await runVerify(
+  { slug: "dino", round: "777", nonce: V_NONCE, item: dinoItem },
+  mkVerifyFetch(dinoLog, { randomness: V_RAND, items: { dino: dinoItems } })
+);
+check("verify: unknown slug uses the list scheme", dinoDom.verdict.className.includes("ok"), dinoDom.verdict.textContent);
+check("verify: items fetched for the list scheme", dinoLog.some((u) => u === "/api/items/dino"), dinoLog.join(","));
+
+// A 404 (the press's probe may have cached one) is retried before failing.
+const retryLog = [];
+const retryFetch = mkVerifyFetch(retryLog, { randomness: V_RAND, items: { animal: animal.items }, beacon404s: 1 });
+const retryDom = await runVerify(
+  { slug: "animal", round: "777", nonce: V_NONCE, item: viaItem, via: "random" },
+  retryFetch
+);
+check("verify: 404 retried then verifies", retryDom.verdict.className.includes("ok"), retryDom.verdict.textContent);
+check("verify: retry hit the beacon twice", retryFetch.beaconCalls() === 2, retryFetch.beaconCalls());
+
+// /verify defaults reconstruct the press derivation for default bounds;
+// custom bounds recompute from the carried min/max.
+const defItem = await deriveItem({ type: "number" }, SHAPE_COLORS, V_RAND, V_NONCE, "number", 0);
+const defDom = await runVerify(
+  { slug: "number", round: "777", nonce: V_NONCE, item: defItem },
+  mkVerifyFetch([], { randomness: V_RAND })
+);
+check("verify: default bounds reconstruct 1-100 derivation", defDom.verdict.className.includes("ok"), defDom.verdict.textContent);
+const custItem = await deriveItem({ type: "number", min: 5, max: 8 }, SHAPE_COLORS, V_RAND, V_NONCE, "number", 0);
+const custDom = await runVerify(
+  { slug: "number", round: "777", nonce: V_NONCE, item: custItem, min: "5", max: "8" },
+  mkVerifyFetch([], { randomness: V_RAND })
+);
+check("verify: custom bounds recompute from min/max", custDom.verdict.className.includes("ok"), custDom.verdict.textContent);
 
 /* report -------------------------------------------------------------- */
 let fails = 0;
