@@ -7,6 +7,7 @@ import worker, {
   computePool,
   builtinPick,
   derivePick,
+  deriveDie,
   deriveItem,
   beaconRoundForTime,
   beaconPublishTime,
@@ -921,7 +922,7 @@ check("home inlines the probe", eqHome.includes("function probeBeaconRound(baseU
 // way: byte-identical to the module sources, free of bundler helpers.
 check(
   "injected bundle is byte-identical to module sources",
-  deriveFnsSrc() === [derivePick, deriveItem, probeBeaconRound].map((f) => f.toString()).join("\n")
+  deriveFnsSrc() === [derivePick, deriveDie, deriveItem, probeBeaconRound].map((f) => f.toString()).join("\n")
 );
 check("shipped home carries no bundler helpers", !eqHome.includes("__name(") && !deriveFnsSrc().includes("__name"));
 check("client shows the pending state", eqHome.includes("awaiting beacon") && eqHome.includes('" round "'));
@@ -1555,6 +1556,877 @@ for (const query of boundRows.map((r) => r[1]).concat(["?min=%3Cscript%3E", "?mi
     "client returned " + nb.a + " / " + nb.b + ", inputs now " + swapMin.value + " / " + swapMax.value
   );
 }
+
+/* 36. /dice server-side tray I/O ----------------------------------------- */
+// Only inspect markup before the inline CLIENT_SCRIPT. The script contains
+// the die-tile HTML template as source text, which must not be counted as a
+// rendered die.
+function diceMarkup(body) {
+  const scriptAt = body.indexOf("<script>");
+  return scriptAt === -1 ? body : body.slice(0, scriptAt);
+}
+function diceValues(body) {
+  const values = [];
+  const re = /<div class="die" data-min="([^"]+)" data-max="([^"]+)">/g;
+  const markup = diceMarkup(body);
+  let m;
+  while ((m = re.exec(markup))) values.push([Number(m[1]), Number(m[2])]);
+  return values;
+}
+function diceTileMarkups(body) {
+  return diceMarkup(body).match(
+    /<div class="die" data-min="[^"]+" data-max="[^"]+">[\s\S]*?<\/button><\/div>/g
+  ) || [];
+}
+function diceRollAllDisabled(body) {
+  const tag = diceMarkup(body).match(/<button class="strike dice-roll-all dice-roll-control"[^>]*>/);
+  return !!(tag && /\sdisabled(?:\s|>)/.test(tag[0]));
+}
+function diceCapShown(body) {
+  const m = diceMarkup(body).match(/<div class="dice-cap"[^>]*>([\s\S]*?)<\/div>/);
+  return !!(m && m[1].trim());
+}
+function repeatedDiceQuery(n, value = "6") {
+  return "?" + Array.from({ length: n }, () => "d=" + encodeURIComponent(value)).join("&");
+}
+
+const diceRows = [
+  ["HAPPY_SHORTHAND", "?d=6&d=20", [[1, 6], [1, 20]], false],
+  ["RANGE", "?d=3-17", [[3, 17]], false],
+  ["NEG_RANGE", "?d=-5--2", [[-5, -2]], false],
+  ["NO_PARAMS", "", [[1, 6]], false],
+  ["INVALID", "?d=abc", [], false],
+  ["ALL_INVALID", "?d=abc&d=", [], false],
+  ["FRACTIONAL_EXPONENT", "?d=5.7&d=1e3", [[1, 6], [1, 1000]], false],
+  ["TRAILING_JUNK", "?d=6abc", [[1, 6]], false],
+  ["OUT_OF_CAP", "?d=-5e12-5e12", [[-1000000000000, 1000000000000]], false],
+  ["SWAPPED", "?d=9-3", [[9, 3]], false],
+  ["DEGENERATE", "?d=4-4", [[4, 4]], false],
+  ["NEG_SHORTHAND", "?d=-3", [[1, -3]], false],
+  ["ZERO", "?d=0", [[1, 0]], false],
+  ["CAP_24", repeatedDiceQuery(30), Array.from({ length: 24 }, () => [1, 6]), true],
+  ["DUPLICATE_OK", "?d=6&d=6", [[1, 6], [1, 6]], false],
+];
+for (const [rowName, query, expected, capShown] of diceRows) {
+  const { status, body } = await cBody("/dice/" + query);
+  const got = diceValues(body);
+  check(
+    "dice " + rowName + " renders the ordered tray",
+    status === 200 &&
+      JSON.stringify(got) === JSON.stringify(expected) &&
+      diceRollAllDisabled(body) === (expected.length === 0) &&
+      diceCapShown(body) === capShown,
+    "status " + status + ", got " + JSON.stringify(got) +
+      ", disabled " + diceRollAllDisabled(body) + ", cap " + diceCapShown(body)
+  );
+}
+
+// The cap boundary is deliberately asserted on both sides in addition to
+// the 30-param matrix row: 24 is accepted quietly; the 25th is dropped and
+// produces the polite cap message.
+for (const [n, shown] of [[24, false], [25, true]]) {
+  const { status, body } = await cBody("/dice/" + repeatedDiceQuery(n));
+  check(
+    "dice cap boundary at " + n,
+    status === 200 && diceValues(body).length === 24 && diceCapShown(body) === shown,
+    "status " + status + ", dice " + diceValues(body).length + ", cap " + diceCapShown(body)
+  );
+}
+
+// Invalid dice are dropped, unlike a request with no d params. Compare both
+// hostile encodings to that empty-tray baseline under one fixed cookie, so
+// any reflected markup or request-dependent script data breaks equality.
+const diceInjectionBaseline = await cBody("/dice/?d=abc", fixedInit);
+for (const [form, query] of [["percent-encoded", "?d=%3Cscript%3E"], ["raw", "?d=<script>"]]) {
+  const { status, body } = await cBody("/dice/" + query, fixedInit);
+  check(
+    "dice MARKUP_INJECTION (" + form + ") renders an inert empty tray",
+    status === 200 && body === diceInjectionBaseline.body && diceValues(body).length === 0,
+    "status " + status + ", body length " + body.length +
+      " vs baseline " + diceInjectionBaseline.body.length
+  );
+}
+
+const dicePage = await cBody("/dice/?d=2&d=6&d=3-17");
+check("homepage links to /dice/", eqHome.includes('href="/dice/"'));
+check("dice page links back to the shelf", diceMarkup(dicePage.body).includes('class="dice-back" href="/"'));
+check(
+  "unrolled dice render coin, d6, and range labels without proof badges",
+  diceMarkup(dicePage.body).includes('class="die-face unrolled">coin</div>') &&
+    diceMarkup(dicePage.body).includes('class="die-face unrolled">d6</div>') &&
+    diceMarkup(dicePage.body).includes('class="die-face unrolled">3–17</div>') &&
+    (diceMarkup(dicePage.body).match(/<div class="proof"><\/div>/g) || []).length === 3
+);
+check(
+  "dice tiles keep a persistent visible identity caption",
+  diceMarkup(dicePage.body).includes('class="die-label" aria-hidden="true">coin</div>') &&
+    diceMarkup(dicePage.body).includes('class="die-label" aria-hidden="true">d6</div>') &&
+    diceMarkup(dicePage.body).includes('class="die-label" aria-hidden="true">3–17</div>')
+);
+check(
+  "dice result announcements use one tray-level live region, not one per face and proof",
+  diceMarkup(dicePage.body).includes('class="dice-tray" aria-live="polite" aria-atomic="false">') &&
+    !/<div class="die-face[^"]*"[^>]*aria-live=/.test(diceMarkup(dicePage.body)) &&
+    !/<div class="proof"[^>]*aria-live=/.test(diceMarkup(dicePage.body))
+);
+
+/* 37. server/client dice agreement --------------------------------------- */
+// Run the parser shipped in CLIENT_SCRIPT, not a test rewrite. Every bound
+// rendered by the server must survive the client acceptance core unchanged;
+// ordering is a separate roll-only operation.
+const diceParseRt = clientRuntime(
+  eqScript,
+  ["diceBound", "dieFromElement", "diceOrdered", "diceLabel", "diceParam", "diceTileMarkup"],
+  {
+    esc: (s) => String(s).replace(/[&<>"]/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])
+    ),
+  }
+);
+function diceAttrTile(min, max) {
+  return {
+    getAttribute: (name) => name === "data-min" ? String(min) : name === "data-max" ? String(max) : null,
+  };
+}
+for (const [rowName, query] of diceRows) {
+  const { status, body } = await cBody("/dice/" + query);
+  const serverDice = diceValues(body);
+  const parsed = serverDice.map(([min, max]) => diceParseRt.dieFromElement(diceAttrTile(min, max)));
+  check(
+    "dice agreement " + rowName + " keeps rendered bounds",
+    status === 200 &&
+      JSON.stringify(parsed) === JSON.stringify(serverDice.map(([min, max]) => ({ min, max }))),
+    JSON.stringify(parsed)
+  );
+}
+check(
+  "dice client acceptance matches rounding, prefix parsing, and cap",
+  diceParseRt.diceBound("5.7") === 6 &&
+    diceParseRt.diceBound("6abc") === 6 &&
+    diceParseRt.diceBound("Infinity") === null &&
+    diceParseRt.diceBound("-5e12") === -1000000000000
+);
+const clientSwapped = diceParseRt.diceOrdered(diceParseRt.dieFromElement(diceAttrTile(9, 3)));
+check(
+  "dice roll ordering swaps 9 / 3 without rewriting the rendered die",
+  clientSwapped.min === 3 && clientSwapped.max === 9 &&
+    diceAttrTile(9, 3).getAttribute("data-min") === "9"
+);
+check(
+  "dice URL serialization is canonical but unswapped",
+  diceParseRt.diceParam({ min: 1, max: 6 }) === "6" &&
+    diceParseRt.diceParam({ min: 9, max: 3 }) === "9-3"
+);
+const tileAgreement = await cBody("/dice/?d=2&d=6&d=3-17&d=0&d=-3&d=1");
+const tileAgreementBounds = [[1, 2], [1, 6], [3, 17], [1, 0], [1, -3], [1, 1]];
+check(
+  "dice server and shipped client emit byte-identical tile templates",
+  JSON.stringify(diceTileMarkups(tileAgreement.body)) === JSON.stringify(
+    tileAgreementBounds.map(([min, max]) => diceParseRt.diceTileMarkup({ min, max }))
+  )
+);
+check(
+  "dice shorthand labels use range form when max is not above min",
+  diceParseRt.diceLabel({ min: 1, max: 0 }) === "1–0" &&
+    diceParseRt.diceLabel({ min: 1, max: -3 }) === "1–-3" &&
+    diceParseRt.diceLabel({ min: 1, max: 1 }) === "1–1" &&
+    !diceMarkup(tileAgreement.body).includes('class="die-face unrolled">d0</div>') &&
+    !diceMarkup(tileAgreement.body).includes('class="die-face unrolled">d-3</div>')
+);
+check(
+  "dice long-number faces clamp their font and hide overflow",
+  eqHome.includes("word-break:break-word; overflow:hidden;") &&
+    eqHome.includes(".die-face.number-face.die-face-long{font-size:9px;")
+);
+const workerExports = await import("./src/worker.js");
+check("dice URL parser stays module-private", !("dieFromParam" in workerExports));
+check(
+  "deriveDie uses the dice slug and requested draw index",
+  (await deriveDie(V_RAND, V_NONCE, 2, 3, 17)) ===
+    3 + (await derivePick(V_RAND, V_NONCE, "dice", 2, 15))
+);
+check(
+  "deriveDie rejects spans wider than 2^32",
+  (await deriveDie(V_RAND, V_NONCE, 0, 1, 5000000000)) === null
+);
+
+/* 38. shipped dice client protocol --------------------------------------- */
+function trackedDiceNode(initialText = "") {
+  let html = "";
+  let text = String(initialText);
+  const node = { className: "" };
+  Object.defineProperties(node, {
+    innerHTML: {
+      get: () => html,
+      set: (value) => { html = String(value); text = ""; },
+    },
+    textContent: {
+      get: () => text,
+      set: (value) => { text = String(value); html = ""; },
+    },
+  });
+  return node;
+}
+
+function fakeDiceButton(attrs = {}) {
+  const handlers = {};
+  return {
+    disabled: false,
+    getAttribute: (name) => attrs[name] === undefined ? null : String(attrs[name]),
+    addEventListener(type, fn) {
+      if (!handlers[type]) handlers[type] = [];
+      handlers[type].push(fn);
+    },
+    click() {
+      if (this.disabled) return undefined;
+      let value;
+      for (const fn of handlers.click || []) value = fn({ target: this });
+      return value;
+    },
+  };
+}
+
+function fakeDiceTile(min, max) {
+  const label = min === 1 && max === 2 ? "coin" : min === 1 && max > min ? "d" + max : min + "–" + max;
+  const face = trackedDiceNode(label);
+  face.className = "die-face unrolled";
+  const caption = trackedDiceNode(label);
+  const proof = trackedDiceNode("");
+  const reroll = fakeDiceButton();
+  const attrs = { "data-min": String(min), "data-max": String(max) };
+  return {
+    face, caption, proof, reroll,
+    getAttribute: (name) => attrs[name] === undefined ? null : attrs[name],
+    querySelector: (sel) =>
+      sel === ".die-face" ? face :
+      sel === ".die-label" ? caption :
+      sel === ".proof" ? proof :
+      sel === ".dice-reroll" ? reroll : null,
+  };
+}
+
+function fakeDiceCard(bounds = [], opts = {}) {
+  const card = {
+    tiles: bounds.map(([min, max]) => fakeDiceTile(min, max)),
+    rollAll: fakeDiceButton(),
+    presets: (opts.presets || [[1, 6]]).map(([min, max]) =>
+      fakeDiceButton({ "data-min": min, "data-max": max })
+    ),
+    addButton: fakeDiceButton(),
+    minInput: { value: opts.customMin === undefined ? "1" : String(opts.customMin), disabled: false },
+    maxInput: { value: opts.customMax === undefined ? "6" : String(opts.customMax), disabled: false },
+    cap: trackedDiceNode(""),
+    err: { hidden: true, textContent: "" },
+    _diceBusy: false,
+  };
+  card.tray = { appendChild: (tile) => { card.tiles.push(tile); return tile; } };
+  card.querySelectorAll = (sel) => {
+    if (sel === ".die[data-min][data-max]") return card.tiles.slice();
+    if (sel === ".dice-roll-control,.dice-preset,.dice-add") {
+      return [card.rollAll]
+        .concat(card.tiles.map((tile) => tile.reroll), card.presets, [card.addButton]);
+    }
+    if (sel === ".dice-custom input") return [card.minInput, card.maxInput];
+    if (sel === ".dice-preset") return card.presets;
+    return [];
+  };
+  card.querySelector = (sel) =>
+    sel === ".dice-roll-all" ? card.rollAll :
+    sel === ".dice-tray" ? card.tray :
+    sel === ".dice-cap" ? card.cap :
+    sel === ".card-err" ? card.err :
+    sel === ".dice-add" ? card.addButton :
+    sel === ".dice-custom-min" ? card.minInput :
+    sel === ".dice-custom-max" ? card.maxInput : null;
+  return card;
+}
+
+function renderedDiceValue(tile) {
+  if (tile.face.className.includes("coin-face")) return tile.face.textContent === "Heads" ? 1 : 2;
+  if (tile.face.className.includes("pip-face")) {
+    return (tile.face.innerHTML.match(/class="pip pip-/g) || []).length;
+  }
+  return Number(tile.face.textContent);
+}
+
+const DICE_PROTOCOL_FNS = [
+  "diceBound", "dieFromElement", "diceTiles", "diceOrdered",
+  "clearDieProof", "showDieProof", "pendingDie", "renderDieResult",
+  "localDie", "fallbackDie", "setDiceBusy", "errEl", "showErr",
+  "rollDiceAll", "rerollDie",
+];
+function diceProtocolRuntime({
+  mintNonce,
+  probe = probeBeaconRound,
+  waitForRound,
+  fetchImpl,
+  local = (min) => min,
+}) {
+  return clientRuntime(eqScript, DICE_PROTOCOL_FNS, {
+    randInt: local,
+    mintNonce,
+    probeBeaconRound: probe,
+    fetchBeacon: waitForRound,
+    deriveDie,
+    BEACON_URL: BEACON_PREFIX,
+    fetch: fetchImpl,
+  });
+}
+
+function loggedBeaconHarness(nonces) {
+  const calls = [];
+  let nonceIx = 0;
+  const beaconFetch = globalThis.fetch;
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    return beaconFetch(url);
+  };
+  return {
+    calls,
+    fetchImpl,
+    mintNonce() {
+      const value = nonces[nonceIx] || "nonce-" + (nonceIx + 1);
+      nonceIx++;
+      return value;
+    },
+    nonceCount: () => nonceIx,
+    latestCount: () => calls.filter((url) => url.split("?")[0] === BEACON_PREFIX + "latest").length,
+    async waitForRound(round) {
+      const res = await fetchImpl(BEACON_PREFIX + round + "?dice-wait=1");
+      if (!res.ok) return null;
+      const body = await res.json();
+      return body && body.randomness ? String(body.randomness) : null;
+    },
+  };
+}
+
+function proofRound(tile) {
+  const m = tile.proof.textContent.match(/round (\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
+beaconMode = "healthy";
+seedBeacon(900000);
+const trayHarness = loggedBeaconHarness(["tray-one", "die-two", "tray-three"]);
+const trayRt = diceProtocolRuntime({
+  mintNonce: trayHarness.mintNonce,
+  waitForRound: trayHarness.waitForRound,
+  fetchImpl: trayHarness.fetchImpl,
+});
+const protocolCard = fakeDiceCard([[10, 20], [100, 105], [9, 3]]);
+await trayRt.rollDiceAll(protocolCard);
+const trayRound1 = 900003;
+const trayRandom1 = await beaconRandomness(trayRound1);
+const trayExpected1 = await Promise.all([
+  deriveDie(trayRandom1, "tray-one", 0, 10, 20),
+  deriveDie(trayRandom1, "tray-one", 1, 100, 105),
+  deriveDie(trayRandom1, "tray-one", 2, 3, 9),
+]);
+check(
+  "dice roll-all makes exactly one commit and one nonce for n dice",
+  trayHarness.latestCount() === 1 && trayHarness.nonceCount() === 1,
+  "latest " + trayHarness.latestCount() + ", nonces " + trayHarness.nonceCount()
+);
+check(
+  "dice roll-all derives every die at its tray index, including swapped bounds",
+  protocolCard.tiles.every((tile, i) => renderedDiceValue(tile) === trayExpected1[i]) &&
+    renderedDiceValue(protocolCard.tiles[2]) >= 3 &&
+    renderedDiceValue(protocolCard.tiles[2]) <= 9,
+  protocolCard.tiles.map(renderedDiceValue).join(",") + " vs " + trayExpected1.join(",")
+);
+check(
+  "dice roll-all unifies per-die round and nonce provenance",
+  protocolCard.tiles.every((tile) =>
+    proofRound(tile) === trayRound1 && tile.proof.textContent.includes("nonce tray-one")
+  ),
+  protocolCard.tiles.map((tile) => tile.proof.textContent).join(" | ")
+);
+const protocolControls = protocolCard.querySelectorAll(".dice-roll-control,.dice-preset,.dice-add");
+check(
+  "dice roll-all settles with controls enabled and no error",
+  !protocolCard._diceBusy &&
+    protocolControls.length > 0 &&
+    protocolControls.every((c) => !c.disabled) &&
+    protocolCard.err.hidden
+);
+
+const peerBeforeReroll = [
+  { value: renderedDiceValue(protocolCard.tiles[0]), proof: protocolCard.tiles[0].proof.textContent },
+  { value: renderedDiceValue(protocolCard.tiles[2]), proof: protocolCard.tiles[2].proof.textContent },
+];
+seedBeacon(910000);
+await trayRt.rerollDie(protocolCard, protocolCard.tiles[1]);
+const rerollRound = 910003;
+const rerollExpected = await deriveDie(
+  await beaconRandomness(rerollRound), "die-two", 0, 100, 105
+);
+check(
+  "dice per-die re-roll uses a fresh nonce and draw index 0",
+  trayHarness.latestCount() === 2 &&
+    trayHarness.nonceCount() === 2 &&
+    renderedDiceValue(protocolCard.tiles[1]) === rerollExpected &&
+    proofRound(protocolCard.tiles[1]) === rerollRound &&
+    protocolCard.tiles[1].proof.textContent.includes("nonce die-two"),
+  protocolCard.tiles[1].proof.textContent
+);
+check(
+  "dice per-die re-roll leaves peer values and provenance untouched",
+  renderedDiceValue(protocolCard.tiles[0]) === peerBeforeReroll[0].value &&
+    protocolCard.tiles[0].proof.textContent === peerBeforeReroll[0].proof &&
+    renderedDiceValue(protocolCard.tiles[2]) === peerBeforeReroll[1].value &&
+    protocolCard.tiles[2].proof.textContent === peerBeforeReroll[1].proof
+);
+
+seedBeacon(920000);
+await trayRt.rollDiceAll(protocolCard);
+const trayRound2 = 920003;
+const trayRandom2 = await beaconRandomness(trayRound2);
+const trayExpected2 = await Promise.all([
+  deriveDie(trayRandom2, "tray-three", 0, 10, 20),
+  deriveDie(trayRandom2, "tray-three", 1, 100, 105),
+  deriveDie(trayRandom2, "tray-three", 2, 3, 9),
+]);
+check(
+  "dice roll-all after a re-roll uses one fresh commit and re-rolls every die",
+  trayHarness.latestCount() === 3 &&
+    trayHarness.nonceCount() === 3 &&
+    protocolCard.tiles.every((tile, i) => renderedDiceValue(tile) === trayExpected2[i])
+);
+check(
+  "dice roll-all after a re-roll reunifies all badges",
+  protocolCard.tiles.every((tile) =>
+    proofRound(tile) === trayRound2 && tile.proof.textContent.includes("nonce tray-three")
+  )
+);
+
+// Exercise signed, zero-minimum, and single-value spans through the shipped
+// roll protocol rather than only through server markup.
+seedBeacon(925000);
+const edgeHarness = loggedBeaconHarness(["edge-spans"]);
+const edgeRt = diceProtocolRuntime({
+  mintNonce: edgeHarness.mintNonce,
+  waitForRound: edgeHarness.waitForRound,
+  fetchImpl: edgeHarness.fetchImpl,
+});
+const edgeCard = fakeDiceCard([[-5, -2], [0, 4], [4, 4], [1, 0], [1, -3]]);
+await edgeRt.rollDiceAll(edgeCard);
+const edgeRound = 925003;
+const edgeRandom = await beaconRandomness(edgeRound);
+const edgeExpected = await Promise.all([
+  deriveDie(edgeRandom, "edge-spans", 0, -5, -2),
+  deriveDie(edgeRandom, "edge-spans", 1, 0, 4),
+  deriveDie(edgeRandom, "edge-spans", 2, 4, 4),
+  deriveDie(edgeRandom, "edge-spans", 3, 0, 1),
+  deriveDie(edgeRandom, "edge-spans", 4, -3, 1),
+]);
+check(
+  "dice roll protocol derives negative, zero-minimum, degenerate, and reversed-shorthand spans",
+  edgeCard.tiles.every((tile, i) => renderedDiceValue(tile) === edgeExpected[i]) &&
+    edgeExpected[2] === 4 &&
+    edgeHarness.latestCount() === 1,
+  edgeCard.tiles.map(renderedDiceValue).join(",") + " vs " + edgeExpected.join(",")
+);
+
+// A locally-falling-back die keeps its original position in the tray. The
+// following eligible die must therefore draw at index 2, not filtered index 1.
+seedBeacon(930000);
+const mixedHarness = loggedBeaconHarness(["mixed"]);
+const mixedRt = diceProtocolRuntime({
+  mintNonce: mixedHarness.mintNonce,
+  waitForRound: mixedHarness.waitForRound,
+  fetchImpl: mixedHarness.fetchImpl,
+});
+const mixedCard = fakeDiceCard([[10, 20], [1, 5000000000], [30, 40]]);
+await mixedRt.rollDiceAll(mixedCard);
+const mixedRound = 930003;
+const mixedRandom = await beaconRandomness(mixedRound);
+const mixedFirst = await deriveDie(mixedRandom, "mixed", 0, 10, 20);
+const mixedThird = await deriveDie(mixedRandom, "mixed", 2, 30, 40);
+check(
+  "dice mixed overflow keeps stable tray draw indices",
+  renderedDiceValue(mixedCard.tiles[0]) === mixedFirst &&
+    renderedDiceValue(mixedCard.tiles[2]) === mixedThird &&
+    mixedHarness.latestCount() === 1 &&
+    mixedHarness.nonceCount() === 1,
+  mixedCard.tiles.map(renderedDiceValue).join(",")
+);
+check(
+  "dice mixed overflow is local and unverified while peers stay verified",
+  mixedCard.tiles[1].proof.innerHTML.includes("unverified") &&
+    mixedCard.tiles[0].proof.textContent.includes("nonce mixed") &&
+    mixedCard.tiles[2].proof.textContent.includes("nonce mixed")
+);
+
+const probesBeforeOverflowReroll = mixedHarness.latestCount();
+const noncesBeforeOverflowReroll = mixedHarness.nonceCount();
+mixedCard.err.hidden = false;
+mixedCard.err.textContent = "old custom-input error";
+await mixedRt.rerollDie(mixedCard, mixedCard.tiles[1]);
+check(
+  "dice overflow re-roll skips beacon and nonce work",
+  mixedHarness.latestCount() === probesBeforeOverflowReroll &&
+    mixedHarness.nonceCount() === noncesBeforeOverflowReroll &&
+    mixedCard.tiles[1].proof.innerHTML.includes("unverified")
+);
+check(
+  "dice overflow re-roll clears a stale card error",
+  mixedCard.err.hidden && mixedCard.err.textContent === "",
+  JSON.stringify(mixedCard.err)
+);
+
+const allOverflowHarness = loggedBeaconHarness(["must-not-mint"]);
+const allOverflowRt = diceProtocolRuntime({
+  mintNonce: allOverflowHarness.mintNonce,
+  waitForRound: allOverflowHarness.waitForRound,
+  fetchImpl: allOverflowHarness.fetchImpl,
+});
+const allOverflowCard = fakeDiceCard([[1, 5000000000], [-1000000000000, 1000000000000]]);
+await allOverflowRt.rollDiceAll(allOverflowCard);
+check(
+  "dice all-overflow roll-all skips the beacon and nonce entirely",
+  allOverflowHarness.latestCount() === 0 &&
+    allOverflowHarness.nonceCount() === 0 &&
+    allOverflowCard.tiles.every((tile) => tile.proof.innerHTML.includes("unverified")) &&
+    !allOverflowCard._diceBusy
+);
+
+// Probe failure is the existing null convention: local results and visible
+// unverified badges, with no card error and no stranded controls.
+beaconMode = "down";
+seedBeacon(940000);
+const downHarness = loggedBeaconHarness(["down-all", "down-one"]);
+const downRt = diceProtocolRuntime({
+  mintNonce: downHarness.mintNonce,
+  waitForRound: downHarness.waitForRound,
+  fetchImpl: downHarness.fetchImpl,
+});
+const downCard = fakeDiceCard([[10, 20], [30, 40]]);
+await downRt.rollDiceAll(downCard);
+check(
+  "dice beacon-down roll-all falls back locally without an error",
+  downHarness.latestCount() === 1 &&
+    downCard.tiles.every((tile) => tile.proof.innerHTML.includes("unverified")) &&
+    downCard.err.hidden &&
+    !downCard._diceBusy
+);
+await downRt.rerollDie(downCard, downCard.tiles[0]);
+check(
+  "dice beacon-down per-die re-roll also recovers locally",
+  downHarness.latestCount() === 2 &&
+    downHarness.nonceCount() === 2 &&
+    downCard.tiles[0].proof.innerHTML.includes("unverified") &&
+    !downCard._diceBusy
+);
+beaconMode = "healthy";
+seedBeacon(950000);
+
+// Hold the commit open to inspect the in-flight state. Only the target die
+// enters pending UI, but every roll/mutation control is disabled page-wide.
+let releaseHeldProbe;
+let heldProbeCalls = 0;
+let heldNonces = 0;
+const heldProbe = new Promise((resolve) => { releaseHeldProbe = resolve; });
+const heldRt = diceProtocolRuntime({
+  mintNonce: () => { heldNonces++; return "held"; },
+  probe: () => { heldProbeCalls++; return heldProbe; },
+  waitForRound: boom("held fetchBeacon"),
+  fetchImpl: boom("held fetch"),
+});
+const heldCard = fakeDiceCard([[10, 20], [30, 40]]);
+heldRt.renderDieResult(heldCard.tiles[0], 12);
+heldRt.showDieProof(heldCard.tiles[0], { round: 1, nonce: "old-a" });
+heldRt.renderDieResult(heldCard.tiles[1], 35);
+heldRt.showDieProof(heldCard.tiles[1], { round: 1, nonce: "old-b" });
+const heldPeerValue = renderedDiceValue(heldCard.tiles[1]);
+const heldPeerProof = heldCard.tiles[1].proof.textContent;
+const heldRoll = heldRt.rerollDie(heldCard, heldCard.tiles[0]);
+await Promise.resolve();
+const controlsDuringWait = heldCard.querySelectorAll(".dice-roll-control,.dice-preset,.dice-add");
+check(
+  "dice in-flight re-roll disables every roll and mutation control",
+  heldCard._diceBusy &&
+    controlsDuringWait.length > 0 &&
+    controlsDuringWait.every((control) => control.disabled) &&
+    heldCard.minInput.disabled &&
+    heldCard.maxInput.disabled
+);
+check(
+  "dice in-flight per-die wait changes only the target die",
+  heldCard.tiles[0].face.textContent.includes("awaiting beacon") &&
+    renderedDiceValue(heldCard.tiles[1]) === heldPeerValue &&
+    heldCard.tiles[1].proof.textContent === heldPeerProof
+);
+const blockedSecondRoll = await heldRt.rollDiceAll(heldCard);
+check(
+  "dice second roll cannot start while a commit is in flight",
+  blockedSecondRoll === false && heldProbeCalls === 1 && heldNonces === 1,
+  "probes " + heldProbeCalls + ", nonces " + heldNonces
+);
+const blockedSecondReroll = await heldRt.rerollDie(heldCard, heldCard.tiles[1]);
+check(
+  "dice per-die busy guard blocks a second re-roll while a commit is in flight",
+  blockedSecondReroll === false && heldProbeCalls === 1 && heldNonces === 1,
+  "probes " + heldProbeCalls + ", nonces " + heldNonces
+);
+releaseHeldProbe(null);
+await heldRoll;
+const recoveredControls = heldCard.querySelectorAll(".dice-roll-control,.dice-preset,.dice-add");
+check(
+  "dice controls recover after the in-flight roll settles",
+  !heldCard._diceBusy &&
+    recoveredControls.length > 0 &&
+    recoveredControls.every((c) => !c.disabled) &&
+    !heldCard.minInput.disabled &&
+    !heldCard.maxInput.disabled
+);
+
+const pendingTile = fakeDiceTile(3, 17);
+heldRt.pendingDie(pendingTile, 12345);
+check(
+  "dice pending copy names the committed beacon round",
+  pendingTile.face.textContent === "awaiting beacon round 12345…",
+  pendingTile.face.textContent
+);
+
+// Result forms: coin words, accessible pips, and numbered/degenerate tiles.
+const renderCard = fakeDiceCard([[1, 2], [1, 6], [3, 17], [4, 4], [-1000000000000, 1000000000000], [2, 1], [6, 1]]);
+heldRt.renderDieResult(renderCard.tiles[0], 1);
+check("dice coin value 1 renders Heads", renderCard.tiles[0].face.textContent === "Heads");
+heldRt.renderDieResult(renderCard.tiles[0], 2);
+check("dice coin value 2 renders Tails", renderCard.tiles[0].face.textContent === "Tails");
+heldRt.renderDieResult(renderCard.tiles[1], 4);
+check(
+  "dice d6 renders four pips with an announced value",
+  renderedDiceValue(renderCard.tiles[1]) === 4 &&
+    renderCard.tiles[1].face.innerHTML.includes('class="dice-value-label">4</span>') &&
+    (renderCard.tiles[1].face.innerHTML.match(/aria-hidden="true"/g) || []).length === 4
+);
+check(
+  "dice d6 pips land at their canonical grid positions",
+  renderCard.tiles[1].face.innerHTML ===
+    '<span class="dice-value-label">4</span>' +
+      [1, 3, 7, 9].map((p) => '<span class="pip pip-' + p + '" aria-hidden="true"></span>').join(""),
+  renderCard.tiles[1].face.innerHTML
+);
+heldRt.renderDieResult(renderCard.tiles[2], 9);
+heldRt.renderDieResult(renderCard.tiles[3], 4);
+check(
+  "dice custom and degenerate dice render numbered tiles",
+  renderedDiceValue(renderCard.tiles[2]) === 9 &&
+    renderedDiceValue(renderCard.tiles[3]) === 4 &&
+    renderCard.tiles[2].face.className.includes("number-face")
+);
+heldRt.renderDieResult(renderCard.tiles[4], -1000000000000);
+check(
+  "dice accepted extreme values render with the long-value font clamp",
+  renderCard.tiles[4].face.textContent === "-1000000000000" &&
+    renderCard.tiles[4].face.className.includes("die-face-long")
+);
+// Special faces follow the label rule: reversed (2,1)/(6,1) dice keep
+// numbered tiles matching their "2–1"/"6–1" captions, not coin or pips.
+heldRt.renderDieResult(renderCard.tiles[5], 1);
+heldRt.renderDieResult(renderCard.tiles[6], 3);
+check(
+  "dice reversed-bounds tiles render numbers, matching their unswapped labels",
+  renderCard.tiles[5].face.className.includes("number-face") &&
+    renderCard.tiles[5].face.textContent === "1" &&
+    renderCard.tiles[6].face.className.includes("number-face") &&
+    renderCard.tiles[6].face.textContent === "3",
+  renderCard.tiles[5].face.className + " / " + renderCard.tiles[6].face.className
+);
+check(
+  "dice result rendering leaves every persistent identity caption unchanged",
+  renderCard.tiles.every((tile) => tile.caption.textContent.length > 0) &&
+    renderCard.tiles[2].caption.textContent === "3–17" &&
+    renderCard.tiles[4].caption.textContent === "-1000000000000–1000000000000"
+);
+heldRt.showDieProof(renderCard.tiles[2], { round: 777, nonce: "proof-only" });
+check(
+  "dice provenance is neutral text and does not claim verification or create a deferred link",
+  renderCard.tiles[2].proof.textContent === "round 777 · nonce proof-only" &&
+    !renderCard.tiles[2].proof.textContent.includes("verified") &&
+    !renderCard.tiles[2].proof.innerHTML.includes("/verify")
+);
+
+/* 39. client tray mutation and address-bar sync -------------------------- */
+function fakeDiceDocument() {
+  return {
+    createElement() {
+      let firstChild = null;
+      const wrap = {};
+      Object.defineProperties(wrap, {
+        innerHTML: {
+          set(markup) {
+            const m = String(markup).match(/data-min="([^"]+)" data-max="([^"]+)"/);
+            firstChild = m ? fakeDiceTile(Number(m[1]), Number(m[2])) : null;
+          },
+        },
+        firstChild: { get: () => firstChild },
+      });
+      return wrap;
+    },
+  };
+}
+
+const DICE_ADD_FNS = [
+  "diceBound", "dieFromElement", "diceTiles", "diceLabel", "diceParam",
+  "diceTileMarkup", "syncDiceUrl", "setDiceBusy", "bindDieReroll",
+  "addDie", "bindDice",
+];
+function diceAddRuntime(href, replacements) {
+  const calls = [];
+  const windowStub = { location: { href } };
+  const historyStub = {
+    replaceState(state, title, next) { calls.push(next); },
+  };
+  const rt = clientRuntime(eqScript, DICE_ADD_FNS, {
+    esc: (s) => String(s).replace(/[&<>"]/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])
+    ),
+    document: fakeDiceDocument(),
+    window: windowStub,
+    history: historyStub,
+    URL,
+    showErr(card, msg) {
+      card.err.hidden = !msg;
+      card.err.textContent = msg || "";
+    },
+    rerollDie: () => Promise.resolve(true),
+    rollDiceAll: () => Promise.resolve(true),
+    ...(replacements || {}),
+  });
+  return { rt, calls, windowStub };
+}
+
+const addEnv = diceAddRuntime("https://random.oddspark.dev/dice/?x=1&d=9-3");
+const addCard = fakeDiceCard([[9, 3]], { presets: [[1, 6]], customMin: 3, customMax: 17 });
+addEnv.rt.bindDice(addCard);
+check(
+  "dice initial bind leaves a loaded unswapped URL unchanged",
+  addEnv.calls.length === 0 &&
+    addCard.tiles[0].getAttribute("data-min") === "9" &&
+    addCard.tiles[0].getAttribute("data-max") === "3"
+);
+addCard.presets[0].click();
+check(
+  "dice preset add mutates the tray once and syncs ordered repeated d params",
+  addCard.tiles.length === 2 &&
+    addEnv.calls.length === 1 &&
+    addEnv.calls[0] === "/dice/?x=1&d=9-3&d=6",
+  addEnv.calls.join(" | ")
+);
+check(
+  "dice newly added preset starts with no proof badge",
+  addCard.tiles[1].proof.innerHTML === "" && addCard.tiles[1].proof.textContent === ""
+);
+addCard.addButton.click();
+check(
+  "dice custom add preserves rendered bound order and syncs without reload",
+  addCard.tiles.length === 3 &&
+    addCard.tiles[2].getAttribute("data-min") === "3" &&
+    addCard.tiles[2].getAttribute("data-max") === "17" &&
+    addEnv.calls[1] === "/dice/?x=1&d=9-3&d=6&d=3-17" &&
+    addEnv.windowStub.location.href === "https://random.oddspark.dev/dice/?x=1&d=9-3",
+  addEnv.calls.join(" | ")
+);
+
+const canonicalEnv = diceAddRuntime("https://random.oddspark.dev/dice/?d=1-6");
+const canonicalCard = fakeDiceCard([[1, 6]], { presets: [[1, 2]] });
+canonicalEnv.rt.bindDice(canonicalCard);
+canonicalCard.presets[0].click();
+check(
+  "dice next mutation canonicalizes shorthand without rewriting on load",
+  canonicalEnv.calls.length === 1 && canonicalEnv.calls[0] === "/dice/?d=6&d=2",
+  canonicalEnv.calls[0]
+);
+
+const bareEnv = diceAddRuntime("https://random.oddspark.dev/dice/");
+const bareCard = fakeDiceCard([[1, 6]], { presets: [[1, 20]] });
+bareEnv.rt.bindDice(bareCard);
+bareCard.presets[0].click();
+check(
+  "dice first mutation from bare /dice/ serializes the rendered default d6",
+  bareEnv.calls.length === 1 && bareEnv.calls[0] === "/dice/?d=6&d=20",
+  bareEnv.calls.join(" | ")
+);
+
+let clickedRollAllCard = null;
+let clickedRerollCard = null;
+let clickedRerollTile = null;
+const clickEnv = diceAddRuntime("https://random.oddspark.dev/dice/?d=6", {
+  rollDiceAll(card) { clickedRollAllCard = card; return Promise.resolve(true); },
+  rerollDie(card, tile) {
+    clickedRerollCard = card;
+    clickedRerollTile = tile;
+    return Promise.resolve(true);
+  },
+});
+const clickCard = fakeDiceCard([[1, 6]]);
+clickEnv.rt.bindDice(clickCard);
+clickCard.rollAll.click();
+clickCard.tiles[0].reroll.click();
+check(
+  "dice bindDice click-through wires roll-all and per-die re-roll buttons",
+  clickedRollAllCard === clickCard &&
+    clickedRerollCard === clickCard &&
+    clickedRerollTile === clickCard.tiles[0]
+);
+
+const surgicalAddEnv = diceAddRuntime("https://random.oddspark.dev/dice/?d=6");
+const surgicalAddCard = fakeDiceCard([[1, 6]]);
+surgicalAddEnv.rt.bindDice(surgicalAddCard);
+surgicalAddCard._diceBusy = true;
+for (const control of surgicalAddCard.querySelectorAll(".dice-roll-control,.dice-preset,.dice-add")) {
+  control.disabled = true;
+}
+surgicalAddCard.minInput.disabled = true;
+surgicalAddCard.maxInput.disabled = true;
+surgicalAddEnv.rt.addDie(surgicalAddCard, { min: 1, max: 8 });
+check(
+  "dice add during a busy card leaves every roll control disabled",
+  surgicalAddCard._diceBusy &&
+    surgicalAddCard.rollAll.disabled &&
+    surgicalAddCard.presets.every((button) => button.disabled) &&
+    surgicalAddCard.addButton.disabled &&
+    surgicalAddCard.minInput.disabled &&
+    surgicalAddCard.maxInput.disabled
+);
+
+const idleAddEnv = diceAddRuntime("https://random.oddspark.dev/dice/?d=abc");
+const idleAddCard = fakeDiceCard([]);
+idleAddEnv.rt.bindDice(idleAddCard);
+idleAddEnv.rt.addDie(idleAddCard, { min: 1, max: 8 });
+check(
+  "dice add on an idle empty tray enables roll-all",
+  !idleAddCard._diceBusy && idleAddCard.tiles.length === 1 && !idleAddCard.rollAll.disabled
+);
+
+const capEnv = diceAddRuntime("https://random.oddspark.dev/dice/" + repeatedDiceQuery(24));
+const capCard = fakeDiceCard(Array.from({ length: 24 }, () => [1, 6]), { presets: [[1, 20]] });
+capEnv.rt.bindDice(capCard);
+capCard.err.hidden = false;
+capCard.err.textContent = "enter a finite minimum and maximum";
+capCard.presets[0].click();
+check(
+  "dice client refuses a 25th die, clears stale input errors, and leaves the URL alone",
+  capCard.tiles.length === 24 &&
+    capCard.cap.textContent.includes("tray holds 24") &&
+    capCard.err.hidden &&
+    capCard.err.textContent === "" &&
+    capEnv.calls.length === 0
+);
+
+const invalidAddEnv = diceAddRuntime("https://random.oddspark.dev/dice/?d=abc");
+const invalidAddCard = fakeDiceCard([], { customMin: "abc", customMax: 6 });
+invalidAddEnv.rt.bindDice(invalidAddCard);
+invalidAddCard.addButton.click();
+check(
+  "dice invalid custom add is not a mutation",
+  invalidAddCard.tiles.length === 0 &&
+    invalidAddEnv.calls.length === 0 &&
+    !invalidAddCard.err.hidden &&
+    invalidAddCard.rollAll.disabled
+);
 
 /* report -------------------------------------------------------------- */
 let fails = 0;
