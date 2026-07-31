@@ -7,6 +7,7 @@ import worker, {
   computePool,
   builtinPick,
   derivePick,
+  deriveDie,
   deriveItem,
   beaconRoundForTime,
   beaconPublishTime,
@@ -759,12 +760,28 @@ const B = (s) => BUILTINS.find((b) => b.slug === s);
 const post = (s) => worker.fetch(req("/api/pick/" + s, { method: "POST" }), env, ctx);
 
 // builtinPick is pure, so hammer it for range invariants rather than exact
-// values. Bounds are where an off-by-one hides.
+// values. Then pin both inclusive bounds with deterministic crypto words;
+// waiting for random sampling to hit both endpoints makes CI flaky.
 const nums = Array.from({ length: 400 }, () => Number(builtinPick(B("number"))));
 check("number is always an integer", nums.every((n) => Number.isInteger(n)));
 check("number never below 1", Math.min(...nums) >= 1, Math.min(...nums));
 check("number never above 100", Math.max(...nums) <= 100, Math.max(...nums));
-check("number reaches both bounds over 400 draws", nums.includes(1) && nums.includes(100));
+const numberRandom = crypto.getRandomValues;
+let numberLow;
+let numberHigh;
+try {
+  crypto.getRandomValues = (buf) => { buf[0] = 0; return buf; };
+  numberLow = Number(builtinPick(B("number")));
+  crypto.getRandomValues = (buf) => { buf[0] = 99; return buf; };
+  numberHigh = Number(builtinPick(B("number")));
+} finally {
+  crypto.getRandomValues = numberRandom;
+}
+check(
+  "number includes both bounds",
+  numberLow === 1 && numberHigh === 100,
+  numberLow + " / " + numberHigh
+);
 
 const cols = Array.from({ length: 200 }, () => builtinPick(B("color")));
 check("color is a 6-digit lowercase hex", cols.every((c) => /^#[0-9a-f]{6}$/.test(c)), cols[0]);
@@ -921,7 +938,7 @@ check("home inlines the probe", eqHome.includes("function probeBeaconRound(baseU
 // way: byte-identical to the module sources, free of bundler helpers.
 check(
   "injected bundle is byte-identical to module sources",
-  deriveFnsSrc() === [derivePick, deriveItem, probeBeaconRound].map((f) => f.toString()).join("\n")
+  deriveFnsSrc() === [derivePick, deriveDie, deriveItem, probeBeaconRound].map((f) => f.toString()).join("\n")
 );
 check("shipped home carries no bundler helpers", !eqHome.includes("__name(") && !deriveFnsSrc().includes("__name"));
 check("client shows the pending state", eqHome.includes("awaiting beacon") && eqHome.includes('" round "'));
@@ -1110,14 +1127,27 @@ seedBeacon(700300);
 const rVerify = await worker.fetch(req("/verify", { headers: { accept: "text/html" } }), env, ctx);
 const verifyHtml = await rVerify.text();
 check("/verify returns 200 HTML", rVerify.status === 200 && verifyHtml.startsWith("<!doctype html>"));
-check("/verify has the form", verifyHtml.includes('id="verify-form"') && verifyHtml.includes('id="v-slug"') && verifyHtml.includes('id="v-item"'));
+check(
+  "/verify has chooser and dice fields",
+  verifyHtml.includes('id="verify-form"') &&
+    verifyHtml.includes('id="v-slug"') &&
+    verifyHtml.includes('id="v-item"') &&
+    verifyHtml.includes('id="v-draw"') &&
+    verifyHtml.includes('id="v-dice"')
+);
 check("/verify leaves no placeholders", !verifyHtml.includes("__DERIVE_FN__") && !verifyHtml.includes("__VERIFY_TYPES__") && !verifyHtml.includes("__SHAPE_COLORS__"));
 check(
   "/verify inlines the derivation",
   verifyHtml.includes("function derivePick(randomness, nonce, slug, drawIx, n)") &&
+    verifyHtml.includes("function deriveDie(randomness, nonce, drawIx, min, max)") &&
     verifyHtml.includes("function deriveItem(c, palette, randomness, nonce, slug, base)")
 );
-check("/verify inlines the type map", verifyHtml.includes('"simpsons-character":"list"') && verifyHtml.includes('"random":"meta"'));
+check(
+  "/verify keeps dice shape-routed rather than reserving the user slug",
+  verifyHtml.includes('"simpsons-character":"list"') &&
+    verifyHtml.includes('"random":"meta"') &&
+    !verifyHtml.includes('"dice":"dice"')
+);
 check("/verify points at the beacon", verifyHtml.includes("https://drand.cloudflare.com/"));
 check("/verify honors the no-template-literal invariant", !verifyHtml.includes("`${"));
 const verifyScript = verifyHtml.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
@@ -1266,14 +1296,22 @@ const TYPES_MAP = Object.fromEntries(BUILTINS.map((b) => [b.slug, b.type]));
 function verifyDom(fields) {
   const verdict = { className: "verdict", textContent: "" };
   const link = { innerHTML: "" };
+  const form = {
+    handlers: {},
+    addEventListener(type, fn) { this.handlers[type] = fn; },
+  };
   const els = {};
-  for (const k of ["slug", "round", "nonce", "item", "via", "min", "max"]) {
+  for (const k of ["slug", "round", "nonce", "item", "via", "min", "max", "draw", "dice"]) {
     els["v-" + k] = { value: fields[k] !== undefined ? fields[k] : "" };
   }
   return {
-    verdict, link,
+    verdict, link, form,
     doc: {
-      getElementById: (id) => (id === "verdict" ? verdict : id === "drand-link" ? link : els[id] || null),
+      getElementById: (id) => (
+        id === "verdict" ? verdict :
+        id === "drand-link" ? link :
+        id === "verify-form" ? form : els[id] || null
+      ),
     },
   };
 }
@@ -1298,10 +1336,14 @@ function mkVerifyFetch(log, { randomness, items = {}, beacon404s = 0 }) {
   return f;
 }
 function verifyRuntime(dom, fetchImpl) {
-  return clientRuntime(verifyScript[1], ["el", "say", "sleepVerify", "fetchRound", "run"], {
+  return clientRuntime(
+    verifyScript[1],
+    ["el", "say", "verifyBound", "verifyDie", "sleepVerify", "fetchRound", "run"],
+    {
     document: dom.doc, TYPES: TYPES_MAP, PALETTE: SHAPE_COLORS,
-    deriveItem, fetch: fetchImpl, BEACON_URL: BEACON_PREFIX,
-  });
+    deriveDie, deriveItem, fetch: fetchImpl, BEACON_URL: BEACON_PREFIX,
+    }
+  );
 }
 async function runVerify(fields, fetchImpl) {
   const dom = verifyDom(fields);
@@ -1310,6 +1352,20 @@ async function runVerify(fields, fetchImpl) {
   const t0 = Date.now();
   while (!/\b(ok|err)\b/.test(dom.verdict.className)) {
     if (Date.now() - t0 > 8000) throw new Error("verify run timed out; verdict: " + dom.verdict.textContent);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return dom;
+}
+
+async function bootVerifyPage(search, fetchImpl) {
+  const dom = verifyDom({});
+  const boot = new Function("document", "location", "fetch", verifyScript[1]);
+  boot(dom.doc, { search }, fetchImpl);
+  const t0 = Date.now();
+  while (!/\b(ok|err)\b/.test(dom.verdict.className)) {
+    if (Date.now() - t0 > 8000) {
+      throw new Error("verify page boot timed out; verdict: " + dom.verdict.textContent);
+    }
     await new Promise((r) => setTimeout(r, 10));
   }
   return dom;
@@ -1376,6 +1432,149 @@ const custDom = await runVerify(
   mkVerifyFetch([], { randomness: V_RAND })
 );
 check("verify: custom bounds recompute from min/max", custDom.verdict.className.includes("ok"), custDom.verdict.textContent);
+
+// Dice replay uses the same accepted d grammar as /dice and derives only the
+// selected, ordered target. The rest of the tray preserves the draw index.
+const diceParserRt = verifyRuntime(verifyDom({}), boom("dice parser fetch"));
+const parsedNegative = diceParserRt.verifyDie("-5--2");
+const parsedSpacedNegative = diceParserRt.verifyDie(" -5--2 ");
+const parsedTrailing = diceParserRt.verifyDie("6abc");
+const parsedClamped = diceParserRt.verifyDie("5e12");
+check(
+  "verify: dice parser mirrors signs, first-hyphen ranges, parseFloat, trimming, and clamping",
+  parsedNegative.min === -5 && parsedNegative.max === -2 &&
+    parsedSpacedNegative.min === -5 && parsedSpacedNegative.max === -2 &&
+    parsedTrailing.min === 1 && parsedTrailing.max === 6 &&
+    parsedClamped.min === 1 && parsedClamped.max === 1000000000000
+);
+
+// `dice` existed as a legal visitor slug before the dice page. Dice replay is
+// shape-routed by its d/draw fields so an ordinary list proof keeps working.
+const diceUserItems = ["one", "two", "three", "four"];
+const diceUserItem = await deriveItem(
+  { type: "list", items: diceUserItems }, SHAPE_COLORS, V_RAND, V_NONCE, "dice", 0
+);
+const diceUserLog = [];
+const diceUserDom = await runVerify(
+  { slug: "dice", round: "777", nonce: V_NONCE, item: diceUserItem },
+  mkVerifyFetch(diceUserLog, { randomness: V_RAND, items: { dice: diceUserItems } })
+);
+check(
+  "verify: a visitor list with slug dice retains ordinary list verification",
+  diceUserDom.verdict.className.includes("ok") &&
+    diceUserLog.some((url) => url === "/api/items/dice"),
+  diceUserDom.verdict.textContent + " / " + diceUserLog.join(" | ")
+);
+
+const trayDice = "10-20,100-105,9-3";
+const trayDiceItem = await deriveDie(V_RAND, V_NONCE, 2, 3, 9);
+const trayDiceLog = [];
+const trayDiceDom = await runVerify(
+  { slug: "dice", round: "777", nonce: V_NONCE, item: String(trayDiceItem), draw: "2", dice: trayDice },
+  mkVerifyFetch(trayDiceLog, { randomness: V_RAND })
+);
+check(
+  "verify: tray target replays at its original draw with swapped derivation bounds",
+  trayDiceDom.verdict.className.includes("ok") && trayDiceDom.verdict.textContent.includes("matches"),
+  trayDiceDom.verdict.textContent
+);
+check(
+  "verify: dice replay never requests an item list",
+  trayDiceLog.length === 1 && trayDiceLog[0].startsWith(BEACON_PREFIX) &&
+    !trayDiceLog.some((url) => url.includes("/api/items/dice")),
+  trayDiceLog.join(" | ")
+);
+
+const singleDiceItem = await deriveDie(V_RAND, V_NONCE, 0, 3, 9);
+const singleDiceDom = await runVerify(
+  { slug: "dice", round: "777", nonce: V_NONCE, item: String(singleDiceItem), draw: "0", dice: "9-3" },
+  mkVerifyFetch([], { randomness: V_RAND })
+);
+check(
+  "verify: single-die reroll replays through the same dice path at draw zero",
+  singleDiceDom.verdict.className.includes("ok"),
+  singleDiceDom.verdict.textContent
+);
+
+const mixedDiceItem = await deriveDie(V_RAND, V_NONCE, 2, 30, 40);
+const mixedDiceDom = await runVerify(
+  {
+    slug: "dice", round: "777", nonce: V_NONCE, item: String(mixedDiceItem), draw: "2",
+    dice: "10-20,1-5000000000,30-40",
+  },
+  mkVerifyFetch([], { randomness: V_RAND })
+);
+check(
+  "verify: non-target overflow keeps the target's tray index replayable",
+  mixedDiceDom.verdict.className.includes("ok"),
+  mixedDiceDom.verdict.textContent
+);
+
+const spacedDiceItem = await deriveDie(V_RAND, V_NONCE, 1, -5, -2);
+const spacedDiceDom = await runVerify(
+  {
+    slug: "dice", round: "777", nonce: V_NONCE, item: String(spacedDiceItem),
+    draw: "1", dice: "6, -5--2",
+  },
+  mkVerifyFetch([], { randomness: V_RAND })
+);
+check(
+  "verify: comma-spaced signed dice replay after manual editing",
+  spacedDiceDom.verdict.className.includes("ok"),
+  spacedDiceDom.verdict.textContent
+);
+
+const wrongTrayDiceItem = trayDiceItem === 3 ? 4 : 3;
+const mismatchDiceDom = await runVerify(
+  {
+    slug: "dice", round: "777", nonce: V_NONCE,
+    item: String(wrongTrayDiceItem), draw: "2", dice: trayDice,
+  },
+  mkVerifyFetch([], { randomness: V_RAND })
+);
+check(
+  "verify: dice mismatch reports the deterministic computed value",
+  mismatchDiceDom.verdict.className.includes("err") &&
+    mismatchDiceDom.verdict.textContent.includes("does not verify") &&
+    mismatchDiceDom.verdict.textContent.includes(String(trayDiceItem)),
+  mismatchDiceDom.verdict.textContent
+);
+
+const invalidDiceProofs = [
+  ["missing tray", { dice: "", draw: "0" }],
+  ["malformed tray", { dice: "6,abc", draw: "0" }],
+  ["more than 24 dice", { dice: Array.from({ length: 25 }, () => "6").join(","), draw: "0" }],
+  ["fractional draw", { dice: "6,20", draw: "0.5" }],
+  ["out-of-range draw", { dice: "6,20", draw: "2" }],
+  ["unprovable target", { dice: "1-5000000000,6", draw: "0" }],
+  ["non-numeric item", { dice: "6", draw: "0", item: "banana" }],
+  ["fractional item", { dice: "6", draw: "0", item: "1.5" }],
+  ["out-of-range item", { dice: "6", draw: "0", item: "7" }],
+  ["irrelevant via metadata", { dice: "6", draw: "0", via: "random" }],
+];
+for (const [name, proof] of invalidDiceProofs) {
+  const log = [];
+  const dom = await runVerify(
+    { slug: "dice", round: "777", nonce: V_NONCE, item: "1", ...proof },
+    mkVerifyFetch(log, { randomness: V_RAND })
+  );
+  check(
+    "verify: " + name + " is rejected before beacon fetch",
+    dom.verdict.className.includes("err") && log.length === 0,
+    dom.verdict.textContent + " / " + log.join(" | ")
+  );
+}
+
+const staleDiceDom = verifyDom({
+  slug: "dice", round: "777", nonce: V_NONCE, item: "1", draw: "0", dice: "abc",
+});
+staleDiceDom.link.innerHTML = '<a href="old-proof">old randomness source</a>';
+verifyRuntime(staleDiceDom, boom("stale dice proof fetched")).run();
+check(
+  "verify: an invalid edited dice proof clears the previous randomness link",
+  staleDiceDom.verdict.className.includes("err") && staleDiceDom.link.innerHTML === "",
+  staleDiceDom.verdict.textContent + " / " + staleDiceDom.link.innerHTML
+);
 
 // The mismatch hint is scoped: built-in lists (ship with the site) and
 // visitor-made lists (fixed forever, old-era caveat) fail differently.
@@ -1555,6 +1754,1432 @@ for (const query of boundRows.map((r) => r[1]).concat(["?min=%3Cscript%3E", "?mi
     "client returned " + nb.a + " / " + nb.b + ", inputs now " + swapMin.value + " / " + swapMax.value
   );
 }
+
+/* 36. /dice server-side tray I/O ----------------------------------------- */
+// Only inspect markup before the inline CLIENT_SCRIPT. The script contains
+// the die-tile HTML template as source text, which must not be counted as a
+// rendered die.
+function diceMarkup(body) {
+  const scriptAt = body.indexOf("<script>");
+  return scriptAt === -1 ? body : body.slice(0, scriptAt);
+}
+function diceValues(body) {
+  const values = [];
+  const re = /<div class="die" data-min="([^"]+)" data-max="([^"]+)">/g;
+  const markup = diceMarkup(body);
+  let m;
+  while ((m = re.exec(markup))) values.push([Number(m[1]), Number(m[2])]);
+  return values;
+}
+function diceTileMarkups(body) {
+  return diceMarkup(body).match(
+    /<div class="die" data-min="[^"]+" data-max="[^"]+">[\s\S]*?<\/button><\/div>/g
+  ) || [];
+}
+function diceRollAllDisabled(body) {
+  const tag = diceMarkup(body).match(/<button class="strike dice-roll-all dice-roll-control"[^>]*>/);
+  return !!(tag && /\sdisabled(?:\s|>)/.test(tag[0]));
+}
+function diceCapShown(body) {
+  const m = diceMarkup(body).match(/<div class="dice-cap"[^>]*>([\s\S]*?)<\/div>/);
+  return !!(m && m[1].trim());
+}
+function repeatedDiceQuery(n, value = "6") {
+  return "?" + Array.from({ length: n }, () => "d=" + encodeURIComponent(value)).join("&");
+}
+
+const diceRows = [
+  ["HAPPY_SHORTHAND", "?d=6&d=20", [[1, 6], [1, 20]], false],
+  ["RANGE", "?d=3-17", [[3, 17]], false],
+  ["NEG_RANGE", "?d=-5--2", [[-5, -2]], false],
+  ["NO_PARAMS", "", [[1, 6]], false],
+  ["INVALID", "?d=abc", [], false],
+  ["ALL_INVALID", "?d=abc&d=", [], false],
+  ["FRACTIONAL_EXPONENT", "?d=5.7&d=1e3", [[1, 6], [1, 1000]], false],
+  ["TRAILING_JUNK", "?d=6abc", [[1, 6]], false],
+  ["OUT_OF_CAP", "?d=-5e12-5e12", [[-1000000000000, 1000000000000]], false],
+  ["SWAPPED", "?d=9-3", [[9, 3]], false],
+  ["DEGENERATE", "?d=4-4", [[4, 4]], false],
+  ["NEG_SHORTHAND", "?d=-3", [[1, -3]], false],
+  ["ZERO", "?d=0", [[1, 0]], false],
+  ["CAP_24", repeatedDiceQuery(30), Array.from({ length: 24 }, () => [1, 6]), true],
+  ["DUPLICATE_OK", "?d=6&d=6", [[1, 6], [1, 6]], false],
+];
+for (const [rowName, query, expected, capShown] of diceRows) {
+  const { status, body } = await cBody("/dice/" + query);
+  const got = diceValues(body);
+  check(
+    "dice " + rowName + " renders the ordered tray",
+    status === 200 &&
+      JSON.stringify(got) === JSON.stringify(expected) &&
+      diceRollAllDisabled(body) === (expected.length === 0) &&
+      diceCapShown(body) === capShown,
+    "status " + status + ", got " + JSON.stringify(got) +
+      ", disabled " + diceRollAllDisabled(body) + ", cap " + diceCapShown(body)
+  );
+}
+
+// The cap boundary is deliberately asserted on both sides in addition to
+// the 30-param matrix row: 24 is accepted quietly; the 25th is dropped and
+// produces the polite cap message.
+for (const [n, shown] of [[24, false], [25, true]]) {
+  const { status, body } = await cBody("/dice/" + repeatedDiceQuery(n));
+  check(
+    "dice cap boundary at " + n,
+    status === 200 && diceValues(body).length === 24 && diceCapShown(body) === shown,
+    "status " + status + ", dice " + diceValues(body).length + ", cap " + diceCapShown(body)
+  );
+}
+
+// Invalid dice are dropped, unlike a request with no d params. Compare both
+// hostile encodings to that empty-tray baseline under one fixed cookie, so
+// any reflected markup or request-dependent script data breaks equality.
+const diceInjectionBaseline = await cBody("/dice/?d=abc", fixedInit);
+for (const [form, query] of [["percent-encoded", "?d=%3Cscript%3E"], ["raw", "?d=<script>"]]) {
+  const { status, body } = await cBody("/dice/" + query, fixedInit);
+  check(
+    "dice MARKUP_INJECTION (" + form + ") renders an inert empty tray",
+    status === 200 && body === diceInjectionBaseline.body && diceValues(body).length === 0,
+    "status " + status + ", body length " + body.length +
+      " vs baseline " + diceInjectionBaseline.body.length
+  );
+}
+
+const dicePage = await cBody("/dice/?d=2&d=6&d=3-17");
+check("homepage links to /dice/", eqHome.includes('href="/dice/"'));
+check("dice page links back to the shelf", diceMarkup(dicePage.body).includes('class="dice-back" href="/"'));
+check(
+  "unrolled dice render coin, d6, and range labels without proof badges",
+  diceMarkup(dicePage.body).includes('class="die-face unrolled">coin</div>') &&
+    diceMarkup(dicePage.body).includes('class="die-face unrolled">d6</div>') &&
+    diceMarkup(dicePage.body).includes('class="die-face unrolled">3–17</div>') &&
+    (diceMarkup(dicePage.body).match(/<div class="proof"><\/div>/g) || []).length === 3
+);
+check(
+  "dice tiles keep a persistent visible identity caption",
+  diceMarkup(dicePage.body).includes('class="die-label" aria-hidden="true">coin</div>') &&
+    diceMarkup(dicePage.body).includes('class="die-label" aria-hidden="true">d6</div>') &&
+    diceMarkup(dicePage.body).includes('class="die-label" aria-hidden="true">3–17</div>')
+);
+check(
+  "dice result announcements use one tray-level live region, not one per face and proof",
+  diceMarkup(dicePage.body).includes('class="dice-tray" aria-live="polite" aria-atomic="false">') &&
+    !/<div class="die-face[^"]*"[^>]*aria-live=/.test(diceMarkup(dicePage.body)) &&
+    !/<div class="proof"[^>]*aria-live=/.test(diceMarkup(dicePage.body))
+);
+
+/* 36b. curl dice tray and server roll ----------------------------------- */
+const DICE_CURL_HEADERS = { "user-agent": "curl/8.4.0", accept: "*/*" };
+const SERVER_DICE_RANDOMNESS = "ab".repeat(32);
+
+function serverDiceBeacon(latest, { publish = true } = {}) {
+  const calls = [];
+  const roundCalls = new Map();
+  return {
+    calls,
+    latestCount() {
+      return calls.filter((raw) => new URL(raw).pathname.endsWith("/latest")).length;
+    },
+    roundCount(round) {
+      return roundCalls.get(round) || 0;
+    },
+    async fetch(raw) {
+      const value = String(raw);
+      if (!value.startsWith(BEACON_PREFIX)) throw new Error("unexpected dice fetch: " + value);
+      calls.push(value);
+      const part = value.slice(BEACON_PREFIX.length).split("?")[0];
+      if (part === "latest") return Response.json({ round: latest });
+      const round = Number(part);
+      const count = (roundCalls.get(round) || 0) + 1;
+      roundCalls.set(round, count);
+      if (round <= latest + 2) {
+        return Response.json({ round, randomness: SERVER_DICE_RANDOMNESS });
+      }
+      if (round === latest + 3 && count > 1 && publish) {
+        return Response.json({ round, randomness: SERVER_DICE_RANDOMNESS });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  };
+}
+
+function fixedDiceRandom(callWidths, { nonceByte = 0x11, localBytes } = {}) {
+  let localCall = 0;
+  return function (array) {
+    callWidths.push(array.byteLength);
+    if (array.byteLength === 8) {
+      array.fill(nonceByte);
+    } else if (array.byteLength === 6) {
+      const byte = localBytes ? localBytes[localCall++] : 0;
+      array.fill(byte === undefined ? 0 : byte);
+    } else {
+      throw new Error("unexpected crypto width: " + array.byteLength);
+    }
+    return array;
+  };
+}
+
+async function withServerDiceGlobals({ fetchImpl, randomImpl, digestImpl }, run) {
+  const previousFetch = globalThis.fetch;
+  const previousRandom = crypto.getRandomValues;
+  const previousDigest = crypto.subtle.digest;
+  globalThis.fetch = fetchImpl;
+  if (randomImpl) crypto.getRandomValues = randomImpl;
+  if (digestImpl) crypto.subtle.digest = digestImpl;
+  try {
+    return await run();
+  } finally {
+    globalThis.fetch = previousFetch;
+    crypto.getRandomValues = previousRandom;
+    crypto.subtle.digest = previousDigest;
+  }
+}
+
+async function serverDiceResponse(url, init = {}) {
+  const request = new Request(url, {
+    ...init,
+    headers: { ...DICE_CURL_HEADERS, ...(init.headers || {}) },
+  });
+  const response = await worker.fetch(request, env, ctx);
+  return { response, body: await response.text() };
+}
+
+function serverDiceItems(body) {
+  const items = [];
+  const re = /^\[(\d+)\] .+ = (-?\d+)$/gm;
+  let match;
+  while ((match = re.exec(body))) items[Number(match[1])] = Number(match[2]);
+  return items;
+}
+
+function serverDiceProofs(body) {
+  return body.split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^https?:\/\/[^/]+\/verify\?/.test(line))
+    .map((line) => new URL(line));
+}
+
+let quietFetches = 0;
+const quietRandomWidths = [];
+const trayOnly = await withServerDiceGlobals(
+  {
+    fetchImpl() { quietFetches++; throw new Error("descriptive dice fetched"); },
+    randomImpl: fixedDiceRandom(quietRandomWidths),
+  },
+  () => serverDiceResponse(
+    "https://dice.example:8443/dice/?d=6abc&d=9-3&raw=%3Cscript%3E"
+  )
+);
+check(
+  "curl dice tray is stable text with a canonical shell-quoted roll command",
+  trayOnly.response.status === 200 &&
+    trayOnly.response.headers.get("content-type") === "text/plain; charset=utf-8" &&
+    trayOnly.response.headers.get("cache-control") === "no-store" &&
+    trayOnly.body ===
+      "dice tray\n[0] d6\n[1] 9\u20133\n" +
+      "roll: curl 'https://dice.example:8443/dice/?d=6&d=9-3&roll'\n",
+  trayOnly.body
+);
+check(
+  "descriptive curl dice does no beacon or random work and echoes no raw query",
+  quietFetches === 0 && quietRandomWidths.length === 0 &&
+    !trayOnly.body.includes("raw") && !trayOnly.body.includes("script") &&
+    !trayOnly.body.includes("6abc"),
+  "fetches " + quietFetches + ", random widths " + quietRandomWidths.join(",")
+);
+
+quietFetches = 0;
+quietRandomWidths.length = 0;
+const defaultTray = await withServerDiceGlobals(
+  {
+    fetchImpl() { quietFetches++; throw new Error("default tray fetched"); },
+    randomImpl: fixedDiceRandom(quietRandomWidths),
+  },
+  () => serverDiceResponse(
+    "https://dice.example/dice/",
+    { headers: { "user-agent": "browser", accept: "text/plain" } }
+  )
+);
+const emptyRoll = await withServerDiceGlobals(
+  {
+    fetchImpl() { quietFetches++; throw new Error("empty tray fetched"); },
+    randomImpl: fixedDiceRandom(quietRandomWidths),
+  },
+  () => serverDiceResponse("https://dice.example/dice/?d=invalid&roll")
+);
+check(
+  "curl dice distinguishes the default d6 from an all-invalid empty tray",
+  defaultTray.body ===
+      "dice tray\n[0] d6\nroll: curl 'https://dice.example/dice/?d=6&roll'\n" &&
+    emptyRoll.body === "dice tray\n(empty)\n" &&
+    quietFetches === 0 && quietRandomWidths.length === 0,
+  defaultTray.body + " / " + emptyRoll.body
+);
+
+const verifiedBeacon = serverDiceBeacon(960000);
+const verifiedRandomWidths = [];
+const verifiedRoll = await withServerDiceGlobals(
+  {
+    fetchImpl: verifiedBeacon.fetch.bind(verifiedBeacon),
+    randomImpl: fixedDiceRandom(verifiedRandomWidths, { nonceByte: 0x11 }),
+  },
+  () => serverDiceResponse(
+    "https://dice.example:8443/dice/?d=6&d=9-3&roll=0&roll=again&junk=secret"
+  )
+);
+const verifiedItems = serverDiceItems(verifiedRoll.body);
+const verifiedProofs = serverDiceProofs(verifiedRoll.body);
+const verifiedNonce = "11".repeat(8);
+const verifiedExpected = await Promise.all([
+  deriveDie(SERVER_DICE_RANDOMNESS, verifiedNonce, 0, 1, 6),
+  deriveDie(SERVER_DICE_RANDOMNESS, verifiedNonce, 1, 3, 9),
+]);
+check(
+  "curl dice roll presence makes one shared commit and exact indexed derivations",
+  verifiedRoll.response.status === 200 &&
+    verifiedRoll.response.headers.get("content-type") === "text/plain; charset=utf-8" &&
+    verifiedRoll.response.headers.get("cache-control") === "no-store" &&
+    verifiedRoll.body.endsWith("\n") &&
+    verifiedBeacon.latestCount() === 1 &&
+    verifiedRandomWidths.filter((n) => n === 8).length === 1 &&
+    JSON.stringify(verifiedItems) === JSON.stringify(verifiedExpected),
+  verifiedRoll.body
+);
+check(
+  "curl dice verified links use request origin, one provenance, and only replay fields",
+  verifiedProofs.length === 2 && verifiedProofs.every((proof, i) =>
+    proof.origin === "https://dice.example:8443" &&
+    proof.pathname === "/verify" &&
+    proof.searchParams.get("slug") === "dice" &&
+    proof.searchParams.get("round") === "960003" &&
+    proof.searchParams.get("nonce") === verifiedNonce &&
+    Number(proof.searchParams.get("item")) === verifiedExpected[i] &&
+    proof.searchParams.get("draw") === String(i) &&
+    JSON.stringify(proof.searchParams.getAll("d")) === JSON.stringify(["6", "9-3"]) &&
+    JSON.stringify([...new Set(proof.searchParams.keys())].sort()) ===
+      JSON.stringify(["d", "draw", "item", "nonce", "round", "slug"]) &&
+    !proof.search.includes("junk") && !proof.search.includes("roll")
+  ),
+  verifiedProofs.map(String).join(" | ")
+);
+const emittedReplay = await bootVerifyPage(
+  verifiedProofs[1].search,
+  mkVerifyFetch([], { randomness: SERVER_DICE_RANDOMNESS })
+);
+check(
+  "curl dice emitted proof auto-replays through the shipped verifier",
+  emittedReplay.verdict.className.includes("ok") &&
+    emittedReplay.doc.getElementById("v-draw").value === "1" &&
+    emittedReplay.doc.getElementById("v-dice").value === "6, 9-3",
+  emittedReplay.verdict.textContent
+);
+
+const mixedBeacon = serverDiceBeacon(970000);
+const mixedServerRandomWidths = [];
+const mixedServerRoll = await withServerDiceGlobals(
+  {
+    fetchImpl: mixedBeacon.fetch.bind(mixedBeacon),
+    randomImpl: fixedDiceRandom(mixedServerRandomWidths, { nonceByte: 0x22 }),
+  },
+  () => serverDiceResponse("https://dice.example/dice/?d=5000000000&d=6&roll")
+);
+const mixedServerItems = serverDiceItems(mixedServerRoll.body);
+const mixedServerProofs = serverDiceProofs(mixedServerRoll.body);
+const mixedServerExpected = await deriveDie(
+  SERVER_DICE_RANDOMNESS, "22".repeat(8), 1, 1, 6
+);
+check(
+  "curl dice mixed overflow stays local while its peer keeps original draw index",
+  mixedServerItems[0] === 1 && mixedServerItems[1] === mixedServerExpected &&
+    (mixedServerRoll.body.match(/^    unverified$/gm) || []).length === 1 &&
+    mixedServerProofs.length === 1 && mixedServerProofs[0].searchParams.get("draw") === "1" &&
+    JSON.stringify(mixedServerProofs[0].searchParams.getAll("d")) ===
+      JSON.stringify(["5000000000", "6"]) &&
+    mixedBeacon.latestCount() === 1 &&
+    JSON.stringify(mixedServerRandomWidths) === JSON.stringify([6, 8]),
+  mixedServerRoll.body
+);
+
+const thresholdBeacon = serverDiceBeacon(975000);
+const thresholdRandomWidths = [];
+const thresholdRoll = await withServerDiceGlobals(
+  {
+    fetchImpl: thresholdBeacon.fetch.bind(thresholdBeacon),
+    randomImpl: fixedDiceRandom(thresholdRandomWidths, { nonceByte: 0x23 }),
+  },
+  () => serverDiceResponse(
+    "https://dice.example/dice/?d=4294967296&d=4294967297&roll"
+  )
+);
+const thresholdProofs = serverDiceProofs(thresholdRoll.body);
+check(
+  "curl dice keeps a 2^32 span verifiable and overflows at 2^32 + 1",
+  thresholdProofs.length === 1 &&
+    thresholdProofs[0].searchParams.get("draw") === "0" &&
+    thresholdProofs[0].searchParams.get("d") === "4294967296" &&
+    (thresholdRoll.body.match(/^    unverified$/gm) || []).length === 1 &&
+    thresholdBeacon.latestCount() === 1 &&
+    JSON.stringify(thresholdRandomWidths) === JSON.stringify([6, 8]),
+  thresholdRoll.body
+);
+
+let overflowFetches = 0;
+const overflowRandomWidths = [];
+const allOverflow = await withServerDiceGlobals(
+  {
+    fetchImpl() { overflowFetches++; throw new Error("overflow tray fetched"); },
+    randomImpl: fixedDiceRandom(overflowRandomWidths, {
+      localBytes: [0xff, 0, 0xff, 0],
+    }),
+  },
+  () => serverDiceResponse(
+    "https://dice.example/dice/?d=5000000000&d=-1000000000000-1000000000000&roll"
+  )
+);
+const overflowItems = serverDiceItems(allOverflow.body);
+check(
+  "curl dice all-overflow roll is bounded, rejection-sampled, and beacon-free",
+  overflowFetches === 0 &&
+    overflowRandomWidths.filter((n) => n === 8).length === 0 &&
+    JSON.stringify(overflowRandomWidths) === JSON.stringify([6, 6, 6, 6]) &&
+    overflowItems[0] === 1 && overflowItems[1] === -1000000000000 &&
+    serverDiceProofs(allOverflow.body).length === 0 &&
+    (allOverflow.body.match(/^    unverified$/gm) || []).length === 2,
+  allOverflow.body + " / " + overflowRandomWidths.join(",")
+);
+
+const syncProbeWidths = [];
+let syncProbeCalls = 0;
+const syncProbeFailure = await withServerDiceGlobals(
+  {
+    fetchImpl() { syncProbeCalls++; throw new Error("sync probe failure"); },
+    randomImpl: fixedDiceRandom(syncProbeWidths, { nonceByte: 0x33 }),
+  },
+  () => serverDiceResponse("https://dice.example/dice/?d=6&d=20&roll")
+);
+check(
+  "curl dice synchronous probe failure atomically falls back every eligible die",
+  syncProbeFailure.response.status === 200 && syncProbeCalls === 1 &&
+    serverDiceProofs(syncProbeFailure.body).length === 0 &&
+    (syncProbeFailure.body.match(/^    unverified$/gm) || []).length === 2 &&
+    JSON.stringify(syncProbeWidths) === JSON.stringify([8, 6, 6]),
+  syncProbeFailure.body
+);
+
+const previousBeaconCap = beaconTiming.capMs;
+beaconTiming.capMs = -1;
+const waitFailureBeacon = serverDiceBeacon(980000, { publish: false });
+const waitFailureWidths = [];
+const waitFailure = await withServerDiceGlobals(
+  {
+    fetchImpl: waitFailureBeacon.fetch.bind(waitFailureBeacon),
+    randomImpl: fixedDiceRandom(waitFailureWidths, { nonceByte: 0x44 }),
+  },
+  () => serverDiceResponse("https://dice.example/dice/?d=6&d=20&roll")
+);
+beaconTiming.capMs = previousBeaconCap;
+check(
+  "curl dice wait failure atomically falls back without a second commit",
+  waitFailure.response.status === 200 && waitFailureBeacon.latestCount() === 1 &&
+    waitFailureBeacon.roundCount(980003) === 2 &&
+    serverDiceProofs(waitFailure.body).length === 0 &&
+    (waitFailure.body.match(/^    unverified$/gm) || []).length === 2,
+  waitFailure.body
+);
+
+const deriveFailureBeacon = serverDiceBeacon(990000);
+const deriveFailureWidths = [];
+let digestCalls = 0;
+const zeroDigest = new Uint8Array(32).buffer;
+const deriveFailure = await withServerDiceGlobals(
+  {
+    fetchImpl: deriveFailureBeacon.fetch.bind(deriveFailureBeacon),
+    randomImpl: fixedDiceRandom(deriveFailureWidths, { nonceByte: 0x55 }),
+    digestImpl() {
+      digestCalls++;
+      return digestCalls === 2
+        ? Promise.reject(new Error("one die derivation rejected"))
+        : Promise.resolve(zeroDigest.slice(0));
+    },
+  },
+  () => serverDiceResponse("https://dice.example/dice/?d=6&d=20&roll")
+);
+check(
+  "curl dice one rejected derivation prevents a partial verified result",
+  deriveFailure.response.status === 200 && deriveFailureBeacon.latestCount() === 1 &&
+    digestCalls === 2 && serverDiceProofs(deriveFailure.body).length === 0 &&
+    (deriveFailure.body.match(/^    unverified$/gm) || []).length === 2 &&
+    JSON.stringify(deriveFailureWidths) === JSON.stringify([8, 6, 6]),
+  deriveFailure.body
+);
+
+const capQuery = Array.from({ length: 24 }, () => "d=6").concat("d=999").join("&");
+const capBeacon = serverDiceBeacon(995000);
+const capRandomWidths = [];
+const cappedServerRoll = await withServerDiceGlobals(
+  {
+    fetchImpl: capBeacon.fetch.bind(capBeacon),
+    randomImpl: fixedDiceRandom(capRandomWidths, { nonceByte: 0x66 }),
+  },
+  () => serverDiceResponse("https://dice.example/dice/?" + capQuery + "&roll")
+);
+const cappedProofs = serverDiceProofs(cappedServerRoll.body);
+check(
+  "curl dice cap rolls and proves exactly the first 24 normalized dice",
+  cappedProofs.length === 24 && capBeacon.latestCount() === 1 &&
+    capRandomWidths.filter((n) => n === 8).length === 1 &&
+    cappedServerRoll.body.includes("tray holds 24 dice; extras were left out.") &&
+    !cappedServerRoll.body.includes("d999") &&
+    cappedProofs.every((proof, i) =>
+      proof.searchParams.get("draw") === String(i) &&
+      proof.searchParams.getAll("d").length === 24 &&
+      proof.searchParams.getAll("d").every((value) => value === "6")
+    ),
+  "proofs " + cappedProofs.length + ", latest " + capBeacon.latestCount()
+);
+
+let ignoredFetches = 0;
+const ignoredRandomWidths = [];
+const ignoredModes = await withServerDiceGlobals(
+  {
+    fetchImpl() { ignoredFetches++; throw new Error("non-text dice fetched"); },
+    randomImpl: fixedDiceRandom(ignoredRandomWidths),
+  },
+  async () => {
+    const htmlPlain = await serverDiceResponse(
+      "https://dice.example/dice/?d=6",
+      { headers: { accept: "text/html", "user-agent": "browser" } }
+    );
+    const htmlRoll = await serverDiceResponse(
+      "https://dice.example/dice/?d=6&roll",
+      { headers: { accept: "text/html", "user-agent": "browser" } }
+    );
+    const headRoll = await serverDiceResponse(
+      "https://dice.example/dice/?d=6&roll",
+      { method: "HEAD" }
+    );
+    const postRoll = await serverDiceResponse(
+      "https://dice.example/dice/?d=6&roll",
+      { method: "POST" }
+    );
+    return { htmlPlain, htmlRoll, headRoll, postRoll };
+  }
+);
+check(
+  "HTML, HEAD, and non-GET dice requests ignore roll and keep route behavior",
+  ignoredModes.htmlPlain.body === ignoredModes.htmlRoll.body &&
+    ignoredModes.htmlRoll.response.headers.get("content-type").includes("text/html") &&
+    ignoredModes.headRoll.response.status === 200 &&
+    ignoredModes.headRoll.response.headers.get("content-type").includes("text/html") &&
+    ignoredModes.postRoll.response.status === 200 &&
+    ignoredModes.postRoll.response.headers.get("content-type").includes("text/html") &&
+    ignoredFetches === 0 && ignoredRandomWidths.length === 0,
+  "fetches " + ignoredFetches + ", random widths " + ignoredRandomWidths.join(",")
+);
+
+/* 37. server/client dice agreement --------------------------------------- */
+// Run the parser shipped in CLIENT_SCRIPT, not a test rewrite. Every bound
+// rendered by the server must survive the client acceptance core unchanged;
+// ordering is a separate roll-only operation.
+const diceParseRt = clientRuntime(
+  eqScript,
+  ["diceBound", "dieFromElement", "diceOrdered", "diceLabel", "diceParam", "diceTileMarkup"],
+  {
+    esc: (s) => String(s).replace(/[&<>"]/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])
+    ),
+  }
+);
+function diceAttrTile(min, max) {
+  return {
+    getAttribute: (name) => name === "data-min" ? String(min) : name === "data-max" ? String(max) : null,
+  };
+}
+for (const [rowName, query] of diceRows) {
+  const { status, body } = await cBody("/dice/" + query);
+  const serverDice = diceValues(body);
+  const parsed = serverDice.map(([min, max]) => diceParseRt.dieFromElement(diceAttrTile(min, max)));
+  check(
+    "dice agreement " + rowName + " keeps rendered bounds",
+    status === 200 &&
+      JSON.stringify(parsed) === JSON.stringify(serverDice.map(([min, max]) => ({ min, max }))),
+    JSON.stringify(parsed)
+  );
+}
+check(
+  "dice client acceptance matches rounding, prefix parsing, and cap",
+  diceParseRt.diceBound("5.7") === 6 &&
+    diceParseRt.diceBound("6abc") === 6 &&
+    diceParseRt.diceBound("Infinity") === null &&
+    diceParseRt.diceBound("-5e12") === -1000000000000
+);
+const clientSwapped = diceParseRt.diceOrdered(diceParseRt.dieFromElement(diceAttrTile(9, 3)));
+check(
+  "dice roll ordering swaps 9 / 3 without rewriting the rendered die",
+  clientSwapped.min === 3 && clientSwapped.max === 9 &&
+    diceAttrTile(9, 3).getAttribute("data-min") === "9"
+);
+check(
+  "dice URL serialization is canonical but unswapped",
+  diceParseRt.diceParam({ min: 1, max: 6 }) === "6" &&
+    diceParseRt.diceParam({ min: 9, max: 3 }) === "9-3"
+);
+const tileAgreement = await cBody("/dice/?d=2&d=6&d=3-17&d=0&d=-3&d=1");
+const tileAgreementBounds = [[1, 2], [1, 6], [3, 17], [1, 0], [1, -3], [1, 1]];
+check(
+  "dice server and shipped client emit byte-identical tile templates",
+  JSON.stringify(diceTileMarkups(tileAgreement.body)) === JSON.stringify(
+    tileAgreementBounds.map(([min, max]) => diceParseRt.diceTileMarkup({ min, max }))
+  )
+);
+check(
+  "dice shorthand labels use range form when max is not above min",
+  diceParseRt.diceLabel({ min: 1, max: 0 }) === "1–0" &&
+    diceParseRt.diceLabel({ min: 1, max: -3 }) === "1–-3" &&
+    diceParseRt.diceLabel({ min: 1, max: 1 }) === "1–1" &&
+    !diceMarkup(tileAgreement.body).includes('class="die-face unrolled">d0</div>') &&
+    !diceMarkup(tileAgreement.body).includes('class="die-face unrolled">d-3</div>')
+);
+check(
+  "dice long-number faces clamp their font and hide overflow",
+  eqHome.includes("word-break:break-word; overflow:hidden;") &&
+    eqHome.includes(".die-face.number-face.die-face-long{font-size:9px;")
+);
+const workerExports = await import("./src/worker.js");
+check("dice URL parser stays module-private", !("dieFromParam" in workerExports));
+check(
+  "curl dice helpers stay module-private",
+  ![
+    "dieParamValue", "orderedDie", "localDieValue", "diceTrayUrl", "diceVerifyUrl",
+    "renderDiceText", "rollDiceText",
+  ]
+    .some((name) => name in workerExports)
+);
+check(
+  "deriveDie uses the dice slug and requested draw index",
+  (await deriveDie(V_RAND, V_NONCE, 2, 3, 17)) ===
+    3 + (await derivePick(V_RAND, V_NONCE, "dice", 2, 15))
+);
+check(
+  "deriveDie rejects spans wider than 2^32",
+  (await deriveDie(V_RAND, V_NONCE, 0, 1, 5000000000)) === null
+);
+
+/* 38. shipped dice client protocol --------------------------------------- */
+function trackedDiceNode(initialText = "") {
+  let html = "";
+  let text = String(initialText);
+  const node = { className: "" };
+  Object.defineProperties(node, {
+    innerHTML: {
+      get: () => html,
+      set: (value) => { html = String(value); text = ""; },
+    },
+    textContent: {
+      get: () => text,
+      set: (value) => { text = String(value); html = ""; },
+    },
+  });
+  return node;
+}
+
+function fakeDiceButton(attrs = {}) {
+  const handlers = {};
+  return {
+    disabled: false,
+    getAttribute: (name) => attrs[name] === undefined ? null : String(attrs[name]),
+    addEventListener(type, fn) {
+      if (!handlers[type]) handlers[type] = [];
+      handlers[type].push(fn);
+    },
+    click() {
+      if (this.disabled) return undefined;
+      let value;
+      for (const fn of handlers.click || []) value = fn({ target: this });
+      return value;
+    },
+  };
+}
+
+function fakeDiceTile(min, max) {
+  const label = min === 1 && max === 2 ? "coin" : min === 1 && max > min ? "d" + max : min + "–" + max;
+  const face = trackedDiceNode(label);
+  face.className = "die-face unrolled";
+  const caption = trackedDiceNode(label);
+  const proof = trackedDiceNode("");
+  const reroll = fakeDiceButton();
+  const attrs = { "data-min": String(min), "data-max": String(max) };
+  return {
+    face, caption, proof, reroll,
+    getAttribute: (name) => attrs[name] === undefined ? null : attrs[name],
+    querySelector: (sel) =>
+      sel === ".die-face" ? face :
+      sel === ".die-label" ? caption :
+      sel === ".proof" ? proof :
+      sel === ".dice-reroll" ? reroll : null,
+  };
+}
+
+function fakeDiceCard(bounds = [], opts = {}) {
+  const card = {
+    tiles: bounds.map(([min, max]) => fakeDiceTile(min, max)),
+    rollAll: fakeDiceButton(),
+    presets: (opts.presets || [[1, 6]]).map(([min, max]) =>
+      fakeDiceButton({ "data-min": min, "data-max": max })
+    ),
+    addButton: fakeDiceButton(),
+    minInput: { value: opts.customMin === undefined ? "1" : String(opts.customMin), disabled: false },
+    maxInput: { value: opts.customMax === undefined ? "6" : String(opts.customMax), disabled: false },
+    cap: trackedDiceNode(""),
+    err: { hidden: true, textContent: "" },
+    _diceBusy: false,
+  };
+  card.tray = { appendChild: (tile) => { card.tiles.push(tile); return tile; } };
+  card.querySelectorAll = (sel) => {
+    if (sel === ".die[data-min][data-max]") return card.tiles.slice();
+    if (sel === ".dice-roll-control,.dice-preset,.dice-add") {
+      return [card.rollAll]
+        .concat(card.tiles.map((tile) => tile.reroll), card.presets, [card.addButton]);
+    }
+    if (sel === ".dice-custom input") return [card.minInput, card.maxInput];
+    if (sel === ".dice-preset") return card.presets;
+    return [];
+  };
+  card.querySelector = (sel) =>
+    sel === ".dice-roll-all" ? card.rollAll :
+    sel === ".dice-tray" ? card.tray :
+    sel === ".dice-cap" ? card.cap :
+    sel === ".card-err" ? card.err :
+    sel === ".dice-add" ? card.addButton :
+    sel === ".dice-custom-min" ? card.minInput :
+    sel === ".dice-custom-max" ? card.maxInput : null;
+  return card;
+}
+
+function renderedDiceValue(tile) {
+  if (tile.face.className.includes("coin-face")) return tile.face.textContent === "Heads" ? 1 : 2;
+  if (tile.face.className.includes("pip-face")) {
+    return (tile.face.innerHTML.match(/class="pip pip-/g) || []).length;
+  }
+  return Number(tile.face.textContent);
+}
+
+const DICE_PROTOCOL_FNS = [
+  "esc", "diceBound", "dieFromElement", "diceTiles", "diceOrdered", "diceLabel", "diceParam",
+  "clearDieProof", "showDieProof", "pendingDie", "renderDieResult",
+  "localDie", "fallbackDie", "setDiceBusy", "errEl", "showErr",
+  "rollDiceAll", "rerollDie",
+];
+function diceProtocolRuntime({
+  mintNonce,
+  probe = probeBeaconRound,
+  waitForRound,
+  fetchImpl,
+  local = (min) => min,
+}) {
+  return clientRuntime(eqScript, DICE_PROTOCOL_FNS, {
+    randInt: local,
+    mintNonce,
+    probeBeaconRound: probe,
+    fetchBeacon: waitForRound,
+    deriveDie,
+    BEACON_URL: BEACON_PREFIX,
+    fetch: fetchImpl,
+  });
+}
+
+function loggedBeaconHarness(nonces) {
+  const calls = [];
+  let nonceIx = 0;
+  const beaconFetch = globalThis.fetch;
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    return beaconFetch(url);
+  };
+  return {
+    calls,
+    fetchImpl,
+    mintNonce() {
+      const value = nonces[nonceIx] || "nonce-" + (nonceIx + 1);
+      nonceIx++;
+      return value;
+    },
+    nonceCount: () => nonceIx,
+    latestCount: () => calls.filter((url) => url.split("?")[0] === BEACON_PREFIX + "latest").length,
+    async waitForRound(round) {
+      const res = await fetchImpl(BEACON_PREFIX + round + "?dice-wait=1");
+      if (!res.ok) return null;
+      const body = await res.json();
+      return body && body.randomness ? String(body.randomness) : null;
+    },
+  };
+}
+
+function diceProofHref(tile) {
+  const m = tile.proof.innerHTML.match(/href="([^"]+)"/);
+  return m ? m[1] : null;
+}
+
+function diceProofUrl(tile) {
+  const href = diceProofHref(tile);
+  return href ? new URL(href, "https://random.oddspark.dev") : null;
+}
+
+function proofRound(tile) {
+  const url = diceProofUrl(tile);
+  return url ? Number(url.searchParams.get("round")) : null;
+}
+
+function proofNonce(tile) {
+  const url = diceProofUrl(tile);
+  return url ? url.searchParams.get("nonce") : null;
+}
+
+beaconMode = "healthy";
+seedBeacon(900000);
+const TRAY_NONCE_1 = "1111111111111111";
+const REROLL_NONCE = "2222222222222222";
+const TRAY_NONCE_2 = "3333333333333333";
+const EDGE_NONCE = "4444444444444444";
+const MIXED_NONCE = "5555555555555555";
+const trayHarness = loggedBeaconHarness([TRAY_NONCE_1, REROLL_NONCE, TRAY_NONCE_2]);
+const trayRt = diceProtocolRuntime({
+  mintNonce: trayHarness.mintNonce,
+  waitForRound: trayHarness.waitForRound,
+  fetchImpl: trayHarness.fetchImpl,
+});
+const protocolCard = fakeDiceCard([[10, 20], [100, 105], [9, 3]]);
+await trayRt.rollDiceAll(protocolCard);
+const trayRound1 = 900003;
+const trayRandom1 = await beaconRandomness(trayRound1);
+const trayExpected1 = await Promise.all([
+  deriveDie(trayRandom1, TRAY_NONCE_1, 0, 10, 20),
+  deriveDie(trayRandom1, TRAY_NONCE_1, 1, 100, 105),
+  deriveDie(trayRandom1, TRAY_NONCE_1, 2, 3, 9),
+]);
+check(
+  "dice roll-all makes exactly one commit and one nonce for n dice",
+  trayHarness.latestCount() === 1 && trayHarness.nonceCount() === 1,
+  "latest " + trayHarness.latestCount() + ", nonces " + trayHarness.nonceCount()
+);
+check(
+  "dice roll-all derives every die at its tray index, including swapped bounds",
+  protocolCard.tiles.every((tile, i) => renderedDiceValue(tile) === trayExpected1[i]) &&
+    renderedDiceValue(protocolCard.tiles[2]) >= 3 &&
+    renderedDiceValue(protocolCard.tiles[2]) <= 9,
+  protocolCard.tiles.map(renderedDiceValue).join(",") + " vs " + trayExpected1.join(",")
+);
+check(
+  "dice roll-all unifies linked per-die round and nonce provenance",
+  protocolCard.tiles.every((tile) =>
+    proofRound(tile) === trayRound1 && proofNonce(tile) === TRAY_NONCE_1
+  ),
+  protocolCard.tiles.map(diceProofHref).join(" | ")
+);
+const trayProofUrls = protocolCard.tiles.map(diceProofUrl);
+check(
+  "dice roll-all proof links carry the complete unswapped tray in order",
+  trayProofUrls.every((url) =>
+    url && url.pathname === "/verify" && url.searchParams.get("slug") === "dice" &&
+    JSON.stringify(url.searchParams.getAll("d")) === JSON.stringify(["10-20", "100-105", "9-3"])
+  ),
+  protocolCard.tiles.map(diceProofHref).join(" | ")
+);
+check(
+  "dice roll-all proof links target each die's original draw and claimed item",
+  trayProofUrls.every((url, i) =>
+    Number(url.searchParams.get("draw")) === i &&
+    Number(url.searchParams.get("item")) === trayExpected1[i]
+  )
+);
+const trayReplayDoms = [];
+for (const url of trayProofUrls) {
+  trayReplayDoms.push(await runVerify(
+    {
+      slug: url.searchParams.get("slug"),
+      round: url.searchParams.get("round"),
+      nonce: url.searchParams.get("nonce"),
+      item: url.searchParams.get("item"),
+      draw: url.searchParams.get("draw"),
+      dice: url.searchParams.getAll("d").join(","),
+    },
+    mkVerifyFetch([], { randomness: trayRandom1 })
+  ));
+}
+check(
+  "dice roll-all badges replay end-to-end through the shipped verifier",
+  trayReplayDoms.every((dom) => dom.verdict.className.includes("ok")),
+  trayReplayDoms.map((dom) => dom.verdict.textContent).join(" | ")
+);
+const autoReplayDom = await bootVerifyPage(
+  trayProofUrls[2].search,
+  mkVerifyFetch([], { randomness: trayRandom1 })
+);
+check(
+  "dice badge query prefills repeated d values and auto-runs the shipped verify page",
+  autoReplayDom.verdict.className.includes("ok") &&
+    autoReplayDom.doc.getElementById("v-draw").value === "2" &&
+    autoReplayDom.doc.getElementById("v-dice").value === "10-20, 100-105, 9-3" &&
+    typeof autoReplayDom.form.handlers.submit === "function",
+  autoReplayDom.verdict.textContent
+);
+const protocolControls = protocolCard.querySelectorAll(".dice-roll-control,.dice-preset,.dice-add");
+check(
+  "dice roll-all settles with controls enabled and no error",
+  !protocolCard._diceBusy &&
+    protocolControls.length > 0 &&
+    protocolControls.every((c) => !c.disabled) &&
+    protocolCard.err.hidden
+);
+
+const peerBeforeReroll = [
+  { value: renderedDiceValue(protocolCard.tiles[0]), proof: protocolCard.tiles[0].proof.innerHTML },
+  { value: renderedDiceValue(protocolCard.tiles[2]), proof: protocolCard.tiles[2].proof.innerHTML },
+];
+seedBeacon(910000);
+await trayRt.rerollDie(protocolCard, protocolCard.tiles[1]);
+const rerollRound = 910003;
+const rerollExpected = await deriveDie(
+  await beaconRandomness(rerollRound), REROLL_NONCE, 0, 100, 105
+);
+check(
+  "dice per-die re-roll uses a fresh nonce and draw index 0",
+  trayHarness.latestCount() === 2 &&
+    trayHarness.nonceCount() === 2 &&
+    renderedDiceValue(protocolCard.tiles[1]) === rerollExpected &&
+    proofRound(protocolCard.tiles[1]) === rerollRound &&
+    proofNonce(protocolCard.tiles[1]) === REROLL_NONCE,
+  protocolCard.tiles[1].proof.innerHTML
+);
+const rerollProofUrl = diceProofUrl(protocolCard.tiles[1]);
+check(
+  "dice per-die re-roll proof is self-contained at draw zero",
+  rerollProofUrl && rerollProofUrl.searchParams.get("draw") === "0" &&
+    JSON.stringify(rerollProofUrl.searchParams.getAll("d")) === JSON.stringify(["100-105"]) &&
+    Number(rerollProofUrl.searchParams.get("item")) === rerollExpected,
+  diceProofHref(protocolCard.tiles[1])
+);
+const rerollReplayDom = await runVerify(
+  {
+    slug: rerollProofUrl.searchParams.get("slug"),
+    round: rerollProofUrl.searchParams.get("round"),
+    nonce: rerollProofUrl.searchParams.get("nonce"),
+    item: rerollProofUrl.searchParams.get("item"),
+    draw: rerollProofUrl.searchParams.get("draw"),
+    dice: rerollProofUrl.searchParams.getAll("d").join(","),
+  },
+  mkVerifyFetch([], { randomness: await beaconRandomness(rerollRound) })
+);
+check(
+  "dice per-die badge replays end-to-end through the shipped verifier",
+  rerollReplayDom.verdict.className.includes("ok"),
+  rerollReplayDom.verdict.textContent
+);
+check(
+  "dice per-die re-roll leaves peer values and provenance untouched",
+  renderedDiceValue(protocolCard.tiles[0]) === peerBeforeReroll[0].value &&
+    protocolCard.tiles[0].proof.innerHTML === peerBeforeReroll[0].proof &&
+    renderedDiceValue(protocolCard.tiles[2]) === peerBeforeReroll[1].value &&
+    protocolCard.tiles[2].proof.innerHTML === peerBeforeReroll[1].proof
+);
+
+seedBeacon(920000);
+await trayRt.rollDiceAll(protocolCard);
+const trayRound2 = 920003;
+const trayRandom2 = await beaconRandomness(trayRound2);
+const trayExpected2 = await Promise.all([
+  deriveDie(trayRandom2, TRAY_NONCE_2, 0, 10, 20),
+  deriveDie(trayRandom2, TRAY_NONCE_2, 1, 100, 105),
+  deriveDie(trayRandom2, TRAY_NONCE_2, 2, 3, 9),
+]);
+check(
+  "dice roll-all after a re-roll uses one fresh commit and re-rolls every die",
+  trayHarness.latestCount() === 3 &&
+    trayHarness.nonceCount() === 3 &&
+    protocolCard.tiles.every((tile, i) => renderedDiceValue(tile) === trayExpected2[i])
+);
+check(
+  "dice roll-all after a re-roll reunifies all badges",
+  protocolCard.tiles.every((tile) =>
+    proofRound(tile) === trayRound2 && proofNonce(tile) === TRAY_NONCE_2
+  )
+);
+
+// Exercise signed, zero-minimum, and single-value spans through the shipped
+// roll protocol rather than only through server markup.
+seedBeacon(925000);
+const edgeHarness = loggedBeaconHarness([EDGE_NONCE]);
+const edgeRt = diceProtocolRuntime({
+  mintNonce: edgeHarness.mintNonce,
+  waitForRound: edgeHarness.waitForRound,
+  fetchImpl: edgeHarness.fetchImpl,
+});
+const edgeCard = fakeDiceCard([[-5, -2], [0, 4], [4, 4], [1, 0], [1, -3]]);
+await edgeRt.rollDiceAll(edgeCard);
+const edgeRound = 925003;
+const edgeRandom = await beaconRandomness(edgeRound);
+const edgeExpected = await Promise.all([
+  deriveDie(edgeRandom, EDGE_NONCE, 0, -5, -2),
+  deriveDie(edgeRandom, EDGE_NONCE, 1, 0, 4),
+  deriveDie(edgeRandom, EDGE_NONCE, 2, 4, 4),
+  deriveDie(edgeRandom, EDGE_NONCE, 3, 0, 1),
+  deriveDie(edgeRandom, EDGE_NONCE, 4, -3, 1),
+]);
+check(
+  "dice roll protocol derives negative, zero-minimum, degenerate, and reversed-shorthand spans",
+  edgeCard.tiles.every((tile, i) => renderedDiceValue(tile) === edgeExpected[i]) &&
+    edgeExpected[2] === 4 &&
+    edgeHarness.latestCount() === 1,
+  edgeCard.tiles.map(renderedDiceValue).join(",") + " vs " + edgeExpected.join(",")
+);
+
+// A locally-falling-back die keeps its original position in the tray. The
+// following eligible die must therefore draw at index 2, not filtered index 1.
+seedBeacon(930000);
+const mixedHarness = loggedBeaconHarness([MIXED_NONCE]);
+const mixedRt = diceProtocolRuntime({
+  mintNonce: mixedHarness.mintNonce,
+  waitForRound: mixedHarness.waitForRound,
+  fetchImpl: mixedHarness.fetchImpl,
+});
+const mixedCard = fakeDiceCard([[10, 20], [1, 5000000000], [30, 40]]);
+await mixedRt.rollDiceAll(mixedCard);
+const mixedRound = 930003;
+const mixedRandom = await beaconRandomness(mixedRound);
+const mixedFirst = await deriveDie(mixedRandom, MIXED_NONCE, 0, 10, 20);
+const mixedThird = await deriveDie(mixedRandom, MIXED_NONCE, 2, 30, 40);
+check(
+  "dice mixed overflow keeps stable tray draw indices",
+  renderedDiceValue(mixedCard.tiles[0]) === mixedFirst &&
+    renderedDiceValue(mixedCard.tiles[2]) === mixedThird &&
+    mixedHarness.latestCount() === 1 &&
+    mixedHarness.nonceCount() === 1,
+  mixedCard.tiles.map(renderedDiceValue).join(",")
+);
+check(
+  "dice mixed overflow is local and unverified while peers stay verified",
+  mixedCard.tiles[1].proof.innerHTML.includes("unverified") &&
+    proofNonce(mixedCard.tiles[0]) === MIXED_NONCE &&
+    proofNonce(mixedCard.tiles[2]) === MIXED_NONCE
+);
+const mixedThirdProof = diceProofUrl(mixedCard.tiles[2]);
+check(
+  "dice mixed-overflow proof retains the overflow die and target index",
+  mixedThirdProof && mixedThirdProof.searchParams.get("draw") === "2" &&
+    JSON.stringify(mixedThirdProof.searchParams.getAll("d")) ===
+      JSON.stringify(["10-20", "5000000000", "30-40"]),
+  diceProofHref(mixedCard.tiles[2])
+);
+
+const probesBeforeOverflowReroll = mixedHarness.latestCount();
+const noncesBeforeOverflowReroll = mixedHarness.nonceCount();
+mixedCard.err.hidden = false;
+mixedCard.err.textContent = "old custom-input error";
+await mixedRt.rerollDie(mixedCard, mixedCard.tiles[1]);
+check(
+  "dice overflow re-roll skips beacon and nonce work",
+  mixedHarness.latestCount() === probesBeforeOverflowReroll &&
+    mixedHarness.nonceCount() === noncesBeforeOverflowReroll &&
+    mixedCard.tiles[1].proof.innerHTML.includes("unverified")
+);
+check(
+  "dice overflow re-roll clears a stale card error",
+  mixedCard.err.hidden && mixedCard.err.textContent === "",
+  JSON.stringify(mixedCard.err)
+);
+
+const allOverflowHarness = loggedBeaconHarness(["8888888888888888"]);
+const allOverflowRt = diceProtocolRuntime({
+  mintNonce: allOverflowHarness.mintNonce,
+  waitForRound: allOverflowHarness.waitForRound,
+  fetchImpl: allOverflowHarness.fetchImpl,
+});
+const allOverflowCard = fakeDiceCard([[1, 5000000000], [-1000000000000, 1000000000000]]);
+await allOverflowRt.rollDiceAll(allOverflowCard);
+check(
+  "dice all-overflow roll-all skips the beacon and nonce entirely",
+  allOverflowHarness.latestCount() === 0 &&
+    allOverflowHarness.nonceCount() === 0 &&
+    allOverflowCard.tiles.every((tile) => tile.proof.innerHTML.includes("unverified")) &&
+    !allOverflowCard._diceBusy
+);
+
+// Probe failure is the existing null convention: local results and visible
+// unverified badges, with no card error and no stranded controls.
+beaconMode = "down";
+seedBeacon(940000);
+const downHarness = loggedBeaconHarness(["6666666666666666", "7777777777777777"]);
+const downRt = diceProtocolRuntime({
+  mintNonce: downHarness.mintNonce,
+  waitForRound: downHarness.waitForRound,
+  fetchImpl: downHarness.fetchImpl,
+});
+const downCard = fakeDiceCard([[10, 20], [30, 40]]);
+await downRt.rollDiceAll(downCard);
+check(
+  "dice beacon-down roll-all falls back locally without an error",
+  downHarness.latestCount() === 1 &&
+    downCard.tiles.every((tile) => tile.proof.innerHTML.includes("unverified")) &&
+    downCard.err.hidden &&
+    !downCard._diceBusy
+);
+await downRt.rerollDie(downCard, downCard.tiles[0]);
+check(
+  "dice beacon-down per-die re-roll also recovers locally",
+  downHarness.latestCount() === 2 &&
+    downHarness.nonceCount() === 2 &&
+    downCard.tiles[0].proof.innerHTML.includes("unverified") &&
+    !downCard._diceBusy
+);
+beaconMode = "healthy";
+seedBeacon(950000);
+
+// Hold the commit open to inspect the in-flight state. Only the target die
+// enters pending UI, but every roll/mutation control is disabled page-wide.
+let releaseHeldProbe;
+let heldProbeCalls = 0;
+let heldNonces = 0;
+const heldProbe = new Promise((resolve) => { releaseHeldProbe = resolve; });
+const heldRt = diceProtocolRuntime({
+  mintNonce: () => { heldNonces++; return "9999999999999999"; },
+  probe: () => { heldProbeCalls++; return heldProbe; },
+  waitForRound: boom("held fetchBeacon"),
+  fetchImpl: boom("held fetch"),
+});
+const heldCard = fakeDiceCard([[10, 20], [30, 40]]);
+heldRt.renderDieResult(heldCard.tiles[0], 12);
+heldRt.showDieProof(heldCard.tiles[0], {
+  round: 1, nonce: "aaaaaaaaaaaaaaaa", item: 12, draw: 0, dice: [{ min: 10, max: 20 }],
+});
+heldRt.renderDieResult(heldCard.tiles[1], 35);
+heldRt.showDieProof(heldCard.tiles[1], {
+  round: 1, nonce: "bbbbbbbbbbbbbbbb", item: 35, draw: 0, dice: [{ min: 30, max: 40 }],
+});
+const heldPeerValue = renderedDiceValue(heldCard.tiles[1]);
+const heldPeerProof = heldCard.tiles[1].proof.innerHTML;
+const heldRoll = heldRt.rerollDie(heldCard, heldCard.tiles[0]);
+await Promise.resolve();
+const controlsDuringWait = heldCard.querySelectorAll(".dice-roll-control,.dice-preset,.dice-add");
+check(
+  "dice in-flight re-roll disables every roll and mutation control",
+  heldCard._diceBusy &&
+    controlsDuringWait.length > 0 &&
+    controlsDuringWait.every((control) => control.disabled) &&
+    heldCard.minInput.disabled &&
+    heldCard.maxInput.disabled
+);
+check(
+  "dice in-flight per-die wait changes only the target die",
+    heldCard.tiles[0].face.textContent.includes("awaiting beacon") &&
+    renderedDiceValue(heldCard.tiles[1]) === heldPeerValue &&
+    heldCard.tiles[1].proof.innerHTML === heldPeerProof
+);
+const blockedSecondRoll = await heldRt.rollDiceAll(heldCard);
+check(
+  "dice second roll cannot start while a commit is in flight",
+  blockedSecondRoll === false && heldProbeCalls === 1 && heldNonces === 1,
+  "probes " + heldProbeCalls + ", nonces " + heldNonces
+);
+const blockedSecondReroll = await heldRt.rerollDie(heldCard, heldCard.tiles[1]);
+check(
+  "dice per-die busy guard blocks a second re-roll while a commit is in flight",
+  blockedSecondReroll === false && heldProbeCalls === 1 && heldNonces === 1,
+  "probes " + heldProbeCalls + ", nonces " + heldNonces
+);
+releaseHeldProbe(null);
+await heldRoll;
+const recoveredControls = heldCard.querySelectorAll(".dice-roll-control,.dice-preset,.dice-add");
+check(
+  "dice controls recover after the in-flight roll settles",
+  !heldCard._diceBusy &&
+    recoveredControls.length > 0 &&
+    recoveredControls.every((c) => !c.disabled) &&
+    !heldCard.minInput.disabled &&
+    !heldCard.maxInput.disabled
+);
+
+const pendingTile = fakeDiceTile(3, 17);
+heldRt.pendingDie(pendingTile, 12345);
+check(
+  "dice pending copy names the committed beacon round",
+  pendingTile.face.textContent === "awaiting beacon round 12345…",
+  pendingTile.face.textContent
+);
+
+// Result forms: coin words, accessible pips, and numbered/degenerate tiles.
+const renderCard = fakeDiceCard([[1, 2], [1, 6], [3, 17], [4, 4], [-1000000000000, 1000000000000], [2, 1], [6, 1]]);
+heldRt.renderDieResult(renderCard.tiles[0], 1);
+check("dice coin value 1 renders Heads", renderCard.tiles[0].face.textContent === "Heads");
+heldRt.renderDieResult(renderCard.tiles[0], 2);
+check("dice coin value 2 renders Tails", renderCard.tiles[0].face.textContent === "Tails");
+heldRt.renderDieResult(renderCard.tiles[1], 4);
+check(
+  "dice d6 renders four pips with an announced value",
+  renderedDiceValue(renderCard.tiles[1]) === 4 &&
+    renderCard.tiles[1].face.innerHTML.includes('class="dice-value-label">4</span>') &&
+    (renderCard.tiles[1].face.innerHTML.match(/aria-hidden="true"/g) || []).length === 4
+);
+check(
+  "dice d6 pips land at their canonical grid positions",
+  renderCard.tiles[1].face.innerHTML ===
+    '<span class="dice-value-label">4</span>' +
+      [1, 3, 7, 9].map((p) => '<span class="pip pip-' + p + '" aria-hidden="true"></span>').join(""),
+  renderCard.tiles[1].face.innerHTML
+);
+heldRt.renderDieResult(renderCard.tiles[2], 9);
+heldRt.renderDieResult(renderCard.tiles[3], 4);
+check(
+  "dice custom and degenerate dice render numbered tiles",
+  renderedDiceValue(renderCard.tiles[2]) === 9 &&
+    renderedDiceValue(renderCard.tiles[3]) === 4 &&
+    renderCard.tiles[2].face.className.includes("number-face")
+);
+heldRt.renderDieResult(renderCard.tiles[4], -1000000000000);
+check(
+  "dice accepted extreme values render with the long-value font clamp",
+  renderCard.tiles[4].face.textContent === "-1000000000000" &&
+    renderCard.tiles[4].face.className.includes("die-face-long")
+);
+// Special faces follow the label rule: reversed (2,1)/(6,1) dice keep
+// numbered tiles matching their "2–1"/"6–1" captions, not coin or pips.
+heldRt.renderDieResult(renderCard.tiles[5], 1);
+heldRt.renderDieResult(renderCard.tiles[6], 3);
+check(
+  "dice reversed-bounds tiles render numbers, matching their unswapped labels",
+  renderCard.tiles[5].face.className.includes("number-face") &&
+    renderCard.tiles[5].face.textContent === "1" &&
+    renderCard.tiles[6].face.className.includes("number-face") &&
+    renderCard.tiles[6].face.textContent === "3",
+  renderCard.tiles[5].face.className + " / " + renderCard.tiles[6].face.className
+);
+check(
+  "dice result rendering leaves every persistent identity caption unchanged",
+  renderCard.tiles.every((tile) => tile.caption.textContent.length > 0) &&
+    renderCard.tiles[2].caption.textContent === "3–17" &&
+    renderCard.tiles[4].caption.textContent === "-1000000000000–1000000000000"
+);
+heldRt.showDieProof(renderCard.tiles[2], {
+  round: 777, nonce: "abcdef0123456789", item: 9, draw: 0,
+  dice: [{ min: 3, max: 17 }],
+});
+const renderedProofUrl = diceProofUrl(renderCard.tiles[2]);
+check(
+  "dice proof badge carries encoded components and an accessible die identity",
+  renderedProofUrl && renderedProofUrl.searchParams.get("nonce") === "abcdef0123456789" &&
+    renderedProofUrl.searchParams.get("item") === "9" &&
+    renderedProofUrl.searchParams.get("d") === "3-17" &&
+    renderCard.tiles[2].proof.innerHTML.includes(
+      'aria-label="Verify 3–17 result at tray draw 0, round 777"'
+    )
+);
+heldRt.showDieProof(renderCard.tiles[3], {
+  round: 777, nonce: 'proof-only"><img', item: 4, draw: 0,
+  dice: [{ min: 4, max: 4 }],
+});
+check(
+  "dice malformed nonce renders plain unverified with no reflected markup",
+  renderCard.tiles[3].proof.innerHTML.includes("unverified") &&
+    !renderCard.tiles[3].proof.innerHTML.includes("/verify") &&
+    !renderCard.tiles[3].proof.innerHTML.includes("<img")
+);
+heldRt.showDieProof(renderCard.tiles[4], {
+  round: 777, nonce: "cccccccccccccccc",
+});
+check(
+  "dice incomplete proof renders plain unverified with no link",
+  renderCard.tiles[4].proof.innerHTML.includes("unverified") &&
+    !renderCard.tiles[4].proof.innerHTML.includes("/verify")
+);
+const emptyZeroProofTile = fakeDiceTile(0, 1);
+heldRt.showDieProof(emptyZeroProofTile, {
+  round: 777, nonce: "dddddddddddddddd", item: "", draw: "",
+  dice: [{ min: 0, max: 1 }],
+});
+check(
+  "dice empty draw and item do not coerce into a verified zero proof",
+  emptyZeroProofTile.proof.innerHTML.includes("unverified") &&
+    !emptyZeroProofTile.proof.innerHTML.includes("/verify")
+);
+
+/* 39. client tray mutation and address-bar sync -------------------------- */
+function fakeDiceDocument() {
+  return {
+    createElement() {
+      let firstChild = null;
+      const wrap = {};
+      Object.defineProperties(wrap, {
+        innerHTML: {
+          set(markup) {
+            const m = String(markup).match(/data-min="([^"]+)" data-max="([^"]+)"/);
+            firstChild = m ? fakeDiceTile(Number(m[1]), Number(m[2])) : null;
+          },
+        },
+        firstChild: { get: () => firstChild },
+      });
+      return wrap;
+    },
+  };
+}
+
+const DICE_ADD_FNS = [
+  "diceBound", "dieFromElement", "diceTiles", "diceLabel", "diceParam",
+  "diceTileMarkup", "syncDiceUrl", "setDiceBusy", "bindDieReroll",
+  "addDie", "bindDice",
+];
+function diceAddRuntime(href, replacements) {
+  const calls = [];
+  const windowStub = { location: { href } };
+  const historyStub = {
+    replaceState(state, title, next) { calls.push(next); },
+  };
+  const rt = clientRuntime(eqScript, DICE_ADD_FNS, {
+    esc: (s) => String(s).replace(/[&<>"]/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])
+    ),
+    document: fakeDiceDocument(),
+    window: windowStub,
+    history: historyStub,
+    URL,
+    showErr(card, msg) {
+      card.err.hidden = !msg;
+      card.err.textContent = msg || "";
+    },
+    rerollDie: () => Promise.resolve(true),
+    rollDiceAll: () => Promise.resolve(true),
+    ...(replacements || {}),
+  });
+  return { rt, calls, windowStub };
+}
+
+const addEnv = diceAddRuntime("https://random.oddspark.dev/dice/?x=1&d=9-3");
+const addCard = fakeDiceCard([[9, 3]], { presets: [[1, 6]], customMin: 3, customMax: 17 });
+addEnv.rt.bindDice(addCard);
+check(
+  "dice initial bind leaves a loaded unswapped URL unchanged",
+  addEnv.calls.length === 0 &&
+    addCard.tiles[0].getAttribute("data-min") === "9" &&
+    addCard.tiles[0].getAttribute("data-max") === "3"
+);
+addCard.presets[0].click();
+check(
+  "dice preset add mutates the tray once and syncs ordered repeated d params",
+  addCard.tiles.length === 2 &&
+    addEnv.calls.length === 1 &&
+    addEnv.calls[0] === "/dice/?x=1&d=9-3&d=6",
+  addEnv.calls.join(" | ")
+);
+check(
+  "dice newly added preset starts with no proof badge",
+  addCard.tiles[1].proof.innerHTML === "" && addCard.tiles[1].proof.textContent === ""
+);
+addCard.addButton.click();
+check(
+  "dice custom add preserves rendered bound order and syncs without reload",
+  addCard.tiles.length === 3 &&
+    addCard.tiles[2].getAttribute("data-min") === "3" &&
+    addCard.tiles[2].getAttribute("data-max") === "17" &&
+    addEnv.calls[1] === "/dice/?x=1&d=9-3&d=6&d=3-17" &&
+    addEnv.windowStub.location.href === "https://random.oddspark.dev/dice/?x=1&d=9-3",
+  addEnv.calls.join(" | ")
+);
+
+const canonicalEnv = diceAddRuntime("https://random.oddspark.dev/dice/?d=1-6");
+const canonicalCard = fakeDiceCard([[1, 6]], { presets: [[1, 2]] });
+canonicalEnv.rt.bindDice(canonicalCard);
+canonicalCard.presets[0].click();
+check(
+  "dice next mutation canonicalizes shorthand without rewriting on load",
+  canonicalEnv.calls.length === 1 && canonicalEnv.calls[0] === "/dice/?d=6&d=2",
+  canonicalEnv.calls[0]
+);
+
+const bareEnv = diceAddRuntime("https://random.oddspark.dev/dice/");
+const bareCard = fakeDiceCard([[1, 6]], { presets: [[1, 20]] });
+bareEnv.rt.bindDice(bareCard);
+bareCard.presets[0].click();
+check(
+  "dice first mutation from bare /dice/ serializes the rendered default d6",
+  bareEnv.calls.length === 1 && bareEnv.calls[0] === "/dice/?d=6&d=20",
+  bareEnv.calls.join(" | ")
+);
+
+let clickedRollAllCard = null;
+let clickedRerollCard = null;
+let clickedRerollTile = null;
+const clickEnv = diceAddRuntime("https://random.oddspark.dev/dice/?d=6", {
+  rollDiceAll(card) { clickedRollAllCard = card; return Promise.resolve(true); },
+  rerollDie(card, tile) {
+    clickedRerollCard = card;
+    clickedRerollTile = tile;
+    return Promise.resolve(true);
+  },
+});
+const clickCard = fakeDiceCard([[1, 6]]);
+clickEnv.rt.bindDice(clickCard);
+clickCard.rollAll.click();
+clickCard.tiles[0].reroll.click();
+check(
+  "dice bindDice click-through wires roll-all and per-die re-roll buttons",
+  clickedRollAllCard === clickCard &&
+    clickedRerollCard === clickCard &&
+    clickedRerollTile === clickCard.tiles[0]
+);
+
+const surgicalAddEnv = diceAddRuntime("https://random.oddspark.dev/dice/?d=6");
+const surgicalAddCard = fakeDiceCard([[1, 6]]);
+surgicalAddEnv.rt.bindDice(surgicalAddCard);
+surgicalAddCard._diceBusy = true;
+for (const control of surgicalAddCard.querySelectorAll(".dice-roll-control,.dice-preset,.dice-add")) {
+  control.disabled = true;
+}
+surgicalAddCard.minInput.disabled = true;
+surgicalAddCard.maxInput.disabled = true;
+surgicalAddEnv.rt.addDie(surgicalAddCard, { min: 1, max: 8 });
+check(
+  "dice add during a busy card leaves every roll control disabled",
+  surgicalAddCard._diceBusy &&
+    surgicalAddCard.rollAll.disabled &&
+    surgicalAddCard.presets.every((button) => button.disabled) &&
+    surgicalAddCard.addButton.disabled &&
+    surgicalAddCard.minInput.disabled &&
+    surgicalAddCard.maxInput.disabled
+);
+
+const idleAddEnv = diceAddRuntime("https://random.oddspark.dev/dice/?d=abc");
+const idleAddCard = fakeDiceCard([]);
+idleAddEnv.rt.bindDice(idleAddCard);
+idleAddEnv.rt.addDie(idleAddCard, { min: 1, max: 8 });
+check(
+  "dice add on an idle empty tray enables roll-all",
+  !idleAddCard._diceBusy && idleAddCard.tiles.length === 1 && !idleAddCard.rollAll.disabled
+);
+
+const capEnv = diceAddRuntime("https://random.oddspark.dev/dice/" + repeatedDiceQuery(24));
+const capCard = fakeDiceCard(Array.from({ length: 24 }, () => [1, 6]), { presets: [[1, 20]] });
+capEnv.rt.bindDice(capCard);
+capCard.err.hidden = false;
+capCard.err.textContent = "enter a finite minimum and maximum";
+capCard.presets[0].click();
+check(
+  "dice client refuses a 25th die, clears stale input errors, and leaves the URL alone",
+  capCard.tiles.length === 24 &&
+    capCard.cap.textContent.includes("tray holds 24") &&
+    capCard.err.hidden &&
+    capCard.err.textContent === "" &&
+    capEnv.calls.length === 0
+);
+
+const invalidAddEnv = diceAddRuntime("https://random.oddspark.dev/dice/?d=abc");
+const invalidAddCard = fakeDiceCard([], { customMin: "abc", customMax: 6 });
+invalidAddEnv.rt.bindDice(invalidAddCard);
+invalidAddCard.addButton.click();
+check(
+  "dice invalid custom add is not a mutation",
+  invalidAddCard.tiles.length === 0 &&
+    invalidAddEnv.calls.length === 0 &&
+    !invalidAddCard.err.hidden &&
+    invalidAddCard.rollAll.disabled
+);
 
 /* report -------------------------------------------------------------- */
 let fails = 0;

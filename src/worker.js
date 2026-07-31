@@ -167,8 +167,10 @@ function randomIndex(n) {
  *   list:   base      -> index in [0, items.length)
  *   meta:   0         -> pool index (slug "random"), then the item draws
  *           above at base 1 against the chosen chooser's slug.
+ *   dice:   tray die i -> index i with slug "dice"; a per-die re-roll
+ *           uses index 0 with the same slug.
  *
- * derivePick, deriveItem and probeBeaconRound are written in the client
+ * derivePick, deriveDie, deriveItem and probeBeaconRound are written in the client
  * script's dialect (var / function, no const or arrows) and deliberately
  * self-contained -- no module-scope reads -- because their SOURCE TEXT
  * is injected into the browser via .toString() (the computePool /
@@ -228,6 +230,18 @@ export function derivePick(randomness, nonce, slug, drawIx, n) {
     });
   }
   return attempt(input, -1);
+}
+
+// A deterministic die result for already-ordered inclusive bounds. Dice
+// always use the shared "dice" seed slug; roll-all supplies the die's tray
+// index, while a per-die re-roll supplies 0. Spans wider than a uint32 draw
+// return null so the client can use the established local fallback.
+export function deriveDie(randomness, nonce, drawIx, min, max) {
+  var span = max - min + 1;
+  if (span > 4294967296) return Promise.resolve(null);
+  return derivePick(randomness, nonce, "dice", drawIx, span).then(function (i) {
+    return i === null ? null : min + i;
+  });
 }
 
 // The deterministic counterpart of builtinPick: same item strings, drawn
@@ -389,6 +403,13 @@ const DERIVE_FNS_SRC_TEXT = `function derivePick(randomness, nonce, slug, drawIx
     });
   }
   return attempt(input, -1);
+}
+function deriveDie(randomness, nonce, drawIx, min, max) {
+  var span = max - min + 1;
+  if (span > 4294967296) return Promise.resolve(null);
+  return derivePick(randomness, nonce, "dice", drawIx, span).then(function (i) {
+    return i === null ? null : min + i;
+  });
 }
 function deriveItem(c, palette, randomness, nonce, slug, base) {
   if (c.type === "number") {
@@ -984,6 +1005,186 @@ function boundFromParam(raw, fallback) {
   return Math.min(1e12, Math.max(-1e12, Math.round(n)));
 }
 
+// One repeated ?d= value. A hyphen at index 0 is a sign; the first later
+// hyphen separates an explicit range. Bounds deliberately remain unsorted
+// here so a shared URL round-trips exactly; the client swaps only for rolls.
+function dieFromParam(raw) {
+  const value = String(raw);
+  const separator = value.indexOf("-", 1);
+  if (separator === -1) {
+    const max = boundFromParam(value, null);
+    return max === null ? null : { min: 1, max };
+  }
+  const min = boundFromParam(value.slice(0, separator), null);
+  const max = boundFromParam(value.slice(separator + 1), null);
+  return min === null || max === null ? null : { min, max };
+}
+
+function dieLabel(die) {
+  if (die.min === 1 && die.max === 2) return "coin";
+  if (die.min === 1 && die.max > die.min) return "d" + die.max;
+  return die.min + "\u2013" + die.max;
+}
+
+function dieParamValue(die) {
+  return die.min === 1 ? String(die.max) : String(die.min) + "-" + String(die.max);
+}
+
+function orderedDie(die) {
+  return die.min <= die.max
+    ? { min: die.min, max: die.max }
+    : { min: die.max, max: die.min };
+}
+
+// Uniform local integer over every accepted dice span. Six random bytes are
+// enough for the full +/-1e12 range and stay exactly representable by Number.
+function localDieValue(die) {
+  if (die.max <= die.min) return die.min;
+  const span = die.max - die.min + 1;
+  const sampleSize = 281474976710656; // 2^48
+  const limit = Math.floor(sampleSize / span) * span;
+  const bytes = new Uint8Array(6);
+  let sample;
+  do {
+    crypto.getRandomValues(bytes);
+    sample = 0;
+    for (let i = 0; i < bytes.length; i++) sample = sample * 256 + bytes[i];
+  } while (sample >= limit);
+  return die.min + (sample % span);
+}
+
+function diceTrayUrl(origin, dice, roll) {
+  const target = new URL("/dice/", origin);
+  for (const die of dice) target.searchParams.append("d", dieParamValue(die));
+  return target.toString() + (roll ? (target.search ? "&roll" : "?roll") : "");
+}
+
+function diceVerifyUrl(origin, dice, result, draw) {
+  const target = new URL("/verify", origin);
+  target.searchParams.set("slug", "dice");
+  target.searchParams.set("round", String(result.round));
+  target.searchParams.set("nonce", result.nonce);
+  target.searchParams.set("item", String(result.item));
+  target.searchParams.set("draw", String(draw));
+  for (const die of dice) target.searchParams.append("d", dieParamValue(die));
+  return target.toString();
+}
+
+function renderDiceText(dice, capped, origin, results) {
+  const lines = ["dice tray"];
+  if (!dice.length) {
+    lines.push("(empty)");
+    return lines.join("\n") + "\n";
+  }
+  for (let i = 0; i < dice.length; i++) {
+    const result = results && results[i];
+    lines.push("[" + i + "] " + dieLabel(dice[i]) + (result ? " = " + result.item : ""));
+    if (result) {
+      if (result.verified) {
+        lines.push("    verified \u00b7 round " + result.round);
+        lines.push("    " + diceVerifyUrl(origin, dice, result, i));
+      } else {
+        lines.push("    unverified");
+      }
+    }
+  }
+  if (capped) lines.push("tray holds 24 dice; extras were left out.");
+  if (!results) lines.push("roll: curl '" + diceTrayUrl(origin, dice, true) + "'");
+  return lines.join("\n") + "\n";
+}
+
+async function rollDiceText(dice, capped, origin) {
+  const results = new Array(dice.length);
+  const eligible = [];
+  for (let i = 0; i < dice.length; i++) {
+    const die = orderedDie(dice[i]);
+    if (die.max - die.min + 1 > 4294967296) {
+      results[i] = { item: localDieValue(die), verified: false };
+    } else {
+      eligible.push({ die, index: i });
+    }
+  }
+
+  if (eligible.length) {
+    let nonce;
+    try {
+      nonce = bytesToHex(crypto.getRandomValues(new Uint8Array(8)));
+      const round = await probeBeaconRound(BEACON_URL, fetch);
+      if (!Number.isInteger(round) || round <= 0) throw new Error("beacon unavailable");
+      const randomness = await awaitBeaconRound(round, fetch);
+      if (!randomness) throw new Error("beacon unavailable");
+      const values = await Promise.all(
+        eligible.map((entry) =>
+          deriveDie(randomness, nonce, entry.index, entry.die.min, entry.die.max)
+        )
+      );
+      if (values.some((value, i) =>
+        !Number.isInteger(value) ||
+        value < eligible[i].die.min || value > eligible[i].die.max
+      )) {
+        throw new Error("dice derivation failed");
+      }
+      for (let i = 0; i < eligible.length; i++) {
+        results[eligible[i].index] = {
+          item: values[i],
+          verified: true,
+          round,
+          nonce,
+        };
+      }
+    } catch (e) {
+      for (const entry of eligible) {
+        results[entry.index] = { item: localDieValue(entry.die), verified: false };
+      }
+    }
+  }
+
+  return renderDiceText(dice, capped, origin, results);
+}
+
+function dieTileHtml(die) {
+  const label = dieLabel(die);
+  return (
+    '<div class="die" data-min="' + esc(die.min) + '" data-max="' + esc(die.max) + '">' +
+    '<div class="die-face unrolled">' + esc(label) + "</div>" +
+    '<div class="die-label" aria-hidden="true">' + esc(label) + "</div>" +
+    '<div class="proof"></div>' +
+    '<button class="dice-reroll dice-roll-control" type="button" aria-label="Re-roll ' + esc(label) + '">Re-roll</button>' +
+    "</div>"
+  );
+}
+
+function diceCardHtml(dice, capped) {
+  const presets = [
+    [2, "coin"], [3, "d3"], [4, "d4"], [6, "d6"], [8, "d8"],
+    [10, "d10"], [12, "d12"], [20, "d20"], [100, "d100"],
+  ];
+  return (
+    '<article class="card dice-card" data-type="dice">' +
+    '<a class="dice-back" href="/">&larr; back to the shelf</a>' +
+    "<h2>dice tray</h2>" +
+    '<div class="blurb">roll the whole tray from one beacon commit, or re-roll one die with its own proof.</div>' +
+    '<div class="dice-presets" aria-label="Add a preset die">' +
+    presets.map(([max, label]) =>
+      '<button class="dice-preset" type="button" data-min="1" data-max="' + esc(max) + '">' + esc(label) + "</button>"
+    ).join("") +
+    "</div>" +
+    '<div class="dice-custom">' +
+    '<label>min <input type="number" class="dice-custom-min" value="1" step="1"></label>' +
+    '<label>max <input type="number" class="dice-custom-max" value="6" step="1"></label>' +
+    '<button class="dice-add" type="button">Add die</button>' +
+    "</div>" +
+    '<div class="dice-tray" aria-live="polite" aria-atomic="false">' + dice.map(dieTileHtml).join("") + "</div>" +
+    '<div class="dice-cap" aria-live="polite">' +
+    (capped ? "tray holds 24 dice; extras were left out." : "") +
+    "</div>" +
+    '<button class="strike dice-roll-all dice-roll-control" type="button"' +
+    (dice.length ? "" : " disabled") + ">Roll all</button>" +
+    '<div class="card-err" hidden></div>' +
+    "</article>"
+  );
+}
+
 function cardHtml(c, count, bounds) {
   const perm = ' <a class="perm" href="/c/' + esc(c.slug) + '" title="permalink">&para;</a>';
   let controls = "";
@@ -1102,6 +1303,7 @@ const CSS = `
      result on the right. Below that it falls back to the normal stacked
      card, which is what a narrow column wants anyway. */
   .card[data-type="meta"]{grid-column:1 / -1}
+  .card[data-type="dice"]{grid-column:1 / -1}
 
   @media (min-width:900px){
     .card[data-type="meta"]{
@@ -1157,6 +1359,59 @@ const CSS = `
     color:var(--text); font-family:var(--mono); font-size:13px; padding:5px 8px;
   }
   .ctl input:focus{outline:1px solid var(--entropy)}
+
+  .dice-back{align-self:flex-start; font-size:11px; color:var(--faint)}
+  .dice-presets{display:flex; flex-wrap:wrap; gap:7px}
+  .dice-presets button,.dice-add,.dice-reroll{
+    background:var(--void); border:1px solid var(--rule); color:var(--text);
+    font-family:var(--mono); font-size:11px; padding:7px 10px; cursor:pointer;
+  }
+  .dice-presets button:hover:not(:disabled),.dice-add:hover:not(:disabled),.dice-reroll:hover:not(:disabled){
+    border-color:var(--entropy); color:#E4EAF0;
+  }
+  .dice-presets button:disabled,.dice-add:disabled,.dice-reroll:disabled{opacity:.45; cursor:wait}
+  .dice-presets button:focus-visible,.dice-add:focus-visible,.dice-reroll:focus-visible{
+    outline:2px solid var(--entropy); outline-offset:2px;
+  }
+  .dice-custom{display:flex; flex-wrap:wrap; align-items:end; gap:10px}
+  .dice-custom label{
+    display:flex; flex-direction:column; gap:4px; color:var(--dim);
+    font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+  }
+  .dice-custom input{
+    width:130px; background:var(--void); border:1px solid var(--rule);
+    color:var(--text); font-family:var(--mono); font-size:13px; padding:7px 8px;
+  }
+  .dice-custom input:focus{outline:1px solid var(--entropy)}
+  .dice-tray{
+    display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:10px;
+  }
+  .die{
+    min-width:0; border:1px solid var(--rule); background:var(--void);
+    padding:12px; display:flex; flex-direction:column; align-items:center; gap:9px;
+  }
+  .die-face{
+    width:82px; height:82px; border:1px solid var(--faint); border-radius:12px;
+    display:flex; align-items:center; justify-content:center; padding:8px;
+    color:#E4EAF0; font-family:var(--serif); font-size:25px; text-align:center;
+    font-variant-numeric:tabular-nums; word-break:break-word; overflow:hidden;
+    line-height:1.05;
+  }
+  .die-face.unrolled{font-family:var(--mono); font-size:16px; color:var(--dim)}
+  .die-face.number-face.die-face-long{font-size:9px; letter-spacing:-.02em; white-space:nowrap}
+  .die-face.pip-face{position:relative; display:grid; grid-template:repeat(3,1fr)/repeat(3,1fr); padding:13px}
+  .dice-value-label{
+    position:absolute; width:1px; height:1px; padding:0; margin:-1px;
+    overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0;
+  }
+  .pip{width:10px; height:10px; border-radius:50%; background:var(--gold); place-self:center}
+  .pip-1{grid-area:1/1}.pip-2{grid-area:1/2}.pip-3{grid-area:1/3}
+  .pip-4{grid-area:2/1}.pip-5{grid-area:2/2}.pip-6{grid-area:2/3}
+  .pip-7{grid-area:3/1}.pip-8{grid-area:3/2}.pip-9{grid-area:3/3}
+  .die-label{font-size:10px; color:var(--dim); letter-spacing:.08em; word-break:break-word; text-align:center}
+  .die .proof{width:100%; min-height:34px; text-align:center; letter-spacing:.06em; text-transform:none}
+  .dice-reroll{width:100%}
+  .dice-cap{min-height:18px; color:var(--dim); font-size:11px}
 
   .ctl-pool{flex-wrap:wrap}
   .ctl-pool .grp{
@@ -1278,6 +1533,11 @@ const CSS = `
 
   @media (prefers-reduced-motion:reduce){
     *{animation:none !important; transition:none !important}
+  }
+  @media (max-width:480px){
+    .dice-custom label{flex:1 1 100px}
+    .dice-custom input{width:100%}
+    .dice-add{flex:1 1 100%}
   }
 `;
 
@@ -1627,6 +1887,390 @@ const CLIENT_SCRIPT = `
       .then(function(){ btn.disabled = false; });
   }
 
+  /* dice tray -------------------------------------------------------- */
+  // This is the same numeric acceptance core as server boundFromParam and
+  // numberBounds.clamped: parseFloat, finite-only, round, clamp +/-1e12.
+  function diceBound(raw){
+    var n = parseFloat(raw);
+    if (!isFinite(n)) return null;
+    n = Math.round(n);
+    if (n > 1e12) n = 1e12;
+    if (n < -1e12) n = -1e12;
+    return n;
+  }
+
+  function dieFromElement(tile){
+    var min = diceBound(tile.getAttribute("data-min"));
+    var max = diceBound(tile.getAttribute("data-max"));
+    if (min === null || max === null) return null;
+    return { min: min, max: max };
+  }
+
+  function diceTiles(card){
+    return card.querySelectorAll(".die[data-min][data-max]");
+  }
+
+  // Sorting is roll-only. The rendered attributes and the share URL always
+  // keep the order supplied by the tray owner.
+  function diceOrdered(die){
+    return die.min <= die.max
+      ? { min: die.min, max: die.max }
+      : { min: die.max, max: die.min };
+  }
+
+  function diceLabel(die){
+    if (die.min === 1 && die.max === 2) return "coin";
+    if (die.min === 1 && die.max > die.min) return "d" + die.max;
+    return die.min + "\u2013" + die.max;
+  }
+
+  function diceParam(die){
+    return die.min === 1 ? String(die.max) : String(die.min) + "-" + String(die.max);
+  }
+
+  function diceTileMarkup(die){
+    var label = diceLabel(die);
+    return '<div class="die" data-min="' + esc(die.min) + '" data-max="' + esc(die.max) + '">' +
+      '<div class="die-face unrolled">' + esc(label) + "</div>" +
+      '<div class="die-label" aria-hidden="true">' + esc(label) + "</div>" +
+      '<div class="proof"></div>' +
+      '<button class="dice-reroll dice-roll-control" type="button" aria-label="Re-roll ' +
+      esc(label) + '">Re-roll</button></div>';
+  }
+
+  function syncDiceUrl(card){
+    var url = new URL(window.location.href);
+    url.searchParams.delete("d");
+    var tiles = diceTiles(card);
+    for (var i = 0; i < tiles.length; i++) {
+      var die = dieFromElement(tiles[i]);
+      if (die) url.searchParams.append("d", diceParam(die));
+    }
+    history.replaceState(null, "", url.pathname + url.search + url.hash);
+  }
+
+  function clearDieProof(tile){
+    var p = tile.querySelector(".proof");
+    if (p) p.innerHTML = "";
+  }
+
+  // A dice badge carries the whole rendered tray and the target's original
+  // index. The tray values stay unswapped here; /verify orders only the
+  // selected die before deriving it. Any incomplete proof stays unverified.
+  function showDieProof(tile, proof){
+    var p = tile.querySelector(".proof");
+    if (!p) return;
+    var drawRaw = proof && proof.draw;
+    var itemRaw = proof && proof.item;
+    var round = proof && Number(proof.round);
+    var draw = drawRaw === null || drawRaw === undefined || String(drawRaw).trim() === ""
+      ? NaN : Number(drawRaw);
+    var item = itemRaw === null || itemRaw === undefined || String(itemRaw).trim() === ""
+      ? NaN : Number(itemRaw);
+    var nonce = proof && typeof proof.nonce === "string" ? proof.nonce : "";
+    var tray = proof && proof.dice;
+    if (!proof || !isFinite(round) || Math.floor(round) !== round || !(round > 0) ||
+        !/^[0-9a-f]{16}$/.test(nonce) || !isFinite(draw) || Math.floor(draw) !== draw ||
+        !isFinite(item) || Math.floor(item) !== item ||
+        !Array.isArray(tray) || !tray.length || tray.length > 24 ||
+        draw < 0 || draw >= tray.length) {
+      p.innerHTML = '<span class="unverified">unverified</span>';
+      return;
+    }
+    var params = [];
+    var target = null;
+    var targetRendered = null;
+    for (var i = 0; i < tray.length; i++) {
+      var min = diceBound(tray[i] && tray[i].min);
+      var max = diceBound(tray[i] && tray[i].max);
+      if (min === null || max === null) {
+        p.innerHTML = '<span class="unverified">unverified</span>';
+        return;
+      }
+      var rendered = { min: min, max: max };
+      params.push(diceParam(rendered));
+      if (i === draw) {
+        targetRendered = rendered;
+        target = diceOrdered(rendered);
+      }
+    }
+    if (!target || target.max - target.min + 1 > 4294967296 ||
+        item < target.min || item > target.max) {
+      p.innerHTML = '<span class="unverified">unverified</span>';
+      return;
+    }
+    var href =
+      "/verify?slug=" + encodeURIComponent("dice") +
+      "&round=" + encodeURIComponent(String(round)) +
+      "&nonce=" + encodeURIComponent(nonce) +
+      "&item=" + encodeURIComponent(String(item)) +
+      "&draw=" + encodeURIComponent(String(draw));
+    for (var k = 0; k < params.length; k++) {
+      href += "&d=" + encodeURIComponent(params[k]);
+    }
+    var label = "Verify " + diceLabel(targetRendered) + " result at tray draw " +
+      draw + ", round " + round;
+    p.innerHTML = '<a href="' + href + '" aria-label="' + esc(label) +
+      '">verified &middot; round ' + round + "</a>";
+  }
+
+  function pendingDie(tile, round){
+    var face = tile.querySelector(".die-face");
+    if (!face) return;
+    face.className = "die-face unrolled";
+    face.textContent = "awaiting beacon" + (round ? " round " + round : "") + "\u2026";
+  }
+
+  function renderDieResult(tile, value){
+    var face = tile.querySelector(".die-face");
+    var rendered = dieFromElement(tile);
+    if (!face || !rendered) return;
+    // Special faces key on the bounds AS RENDERED, matching the labels: a
+    // reversed (2,1) or (6,1) die keeps a numbered tile, not coin or pips.
+    if (rendered.min === 1 && rendered.max === 2) {
+      face.className = "die-face coin-face";
+      face.textContent = Number(value) === 1 ? "Heads" : "Tails";
+      return;
+    }
+    if (rendered.min === 1 && rendered.max === 6) {
+      var positions = {
+        1: [5], 2: [1, 9], 3: [1, 5, 9],
+        4: [1, 3, 7, 9], 5: [1, 3, 5, 7, 9], 6: [1, 3, 4, 6, 7, 9]
+      };
+      var pips = positions[Number(value)] || [];
+      var markup = '<span class="dice-value-label">' + String(Number(value)) + "</span>";
+      for (var i = 0; i < pips.length; i++) {
+        markup += '<span class="pip pip-' + pips[i] + '" aria-hidden="true"></span>';
+      }
+      face.className = "die-face pip-face";
+      face.innerHTML = markup;
+      return;
+    }
+    var numberText = String(value);
+    face.className = "die-face number-face" + (numberText.length > 6 ? " die-face-long" : "");
+    face.textContent = numberText;
+  }
+
+  function localDie(die){
+    return randInt(die.min, die.max);
+  }
+
+  function fallbackDie(tile, die){
+    renderDieResult(tile, localDie(die));
+    showDieProof(tile, null);
+  }
+
+  function setDiceBusy(card, busy){
+    card._diceBusy = !!busy;
+    var controls = card.querySelectorAll(".dice-roll-control,.dice-preset,.dice-add");
+    for (var i = 0; i < controls.length; i++) controls[i].disabled = !!busy;
+    var inputs = card.querySelectorAll(".dice-custom input");
+    for (var k = 0; k < inputs.length; k++) inputs[k].disabled = !!busy;
+    if (!busy) {
+      var all = card.querySelector(".dice-roll-all");
+      if (all) all.disabled = diceTiles(card).length === 0;
+    }
+  }
+
+  function rollDiceAll(card){
+    if (card._diceBusy) return Promise.resolve(false);
+    var tiles = diceTiles(card);
+    if (!tiles.length) {
+      setDiceBusy(card, false);
+      return Promise.resolve(false);
+    }
+    var entries = [];
+    var tray = [];
+    var proofableTray = tiles.length <= 24;
+    for (var i = 0; i < tiles.length; i++) {
+      var rendered = dieFromElement(tiles[i]);
+      if (rendered) {
+        tray.push({ min: rendered.min, max: rendered.max });
+        entries.push({ tile: tiles[i], die: diceOrdered(rendered), index: i });
+      } else {
+        proofableTray = false;
+      }
+    }
+    if (!entries.length) {
+      setDiceBusy(card, false);
+      return Promise.resolve(false);
+    }
+
+    setDiceBusy(card, true);
+    showErr(card, "");
+    var eligible = [];
+    for (var k = 0; k < entries.length; k++) {
+      clearDieProof(entries[k].tile);
+      if (entries[k].die.max - entries[k].die.min + 1 > 4294967296) {
+        fallbackDie(entries[k].tile, entries[k].die);
+      } else {
+        pendingDie(entries[k].tile, 0);
+        eligible.push(entries[k]);
+      }
+    }
+    // No commit exists when every die exceeds the derivation limit.
+    if (!eligible.length) {
+      setDiceBusy(card, false);
+      return Promise.resolve(true);
+    }
+
+    var nonce = mintNonce();
+    function fallback(){
+      for (var j = 0; j < eligible.length; j++) fallbackDie(eligible[j].tile, eligible[j].die);
+    }
+    function rescue(e){
+      try { fallback(); }
+      catch (e2) { showErr(card, "no roll: " + (e2 && e2.message ? e2.message : e2)); }
+    }
+    return Promise.resolve()
+      .then(function () { return probeBeaconRound(BEACON_URL, fetch); })
+      .then(function(round){
+        if (round === null) { fallback(); return null; }
+        for (var j = 0; j < eligible.length; j++) pendingDie(eligible[j].tile, round);
+        return fetchBeacon(round).then(function(randomness){
+          if (!randomness) { fallback(); return null; }
+          var draws = [];
+          for (var m = 0; m < eligible.length; m++) {
+            draws.push(deriveDie(
+              randomness, nonce, eligible[m].index,
+              eligible[m].die.min, eligible[m].die.max
+            ));
+          }
+          return Promise.all(draws).then(function(values){
+            for (var n = 0; n < eligible.length; n++) {
+              if (values[n] === null) {
+                fallbackDie(eligible[n].tile, eligible[n].die);
+              } else {
+                renderDieResult(eligible[n].tile, values[n]);
+                showDieProof(eligible[n].tile, {
+                  round: round, nonce: nonce, item: values[n],
+                  draw: eligible[n].index, dice: proofableTray ? tray : null
+                });
+              }
+            }
+          });
+        });
+      })
+      .catch(rescue)
+      .then(function(){ setDiceBusy(card, false); return true; });
+  }
+
+  function rerollDie(card, tile){
+    if (card._diceBusy) return Promise.resolve(false);
+    var rendered = dieFromElement(tile);
+    if (!rendered) return Promise.resolve(false);
+    var die = diceOrdered(rendered);
+    showErr(card, "");
+    if (die.max - die.min + 1 > 4294967296) {
+      fallbackDie(tile, die);
+      return Promise.resolve(true);
+    }
+
+    setDiceBusy(card, true);
+    clearDieProof(tile);
+    pendingDie(tile, 0);
+    var nonce = mintNonce();
+    function fallback(){ fallbackDie(tile, die); }
+    function rescue(e){
+      try { fallback(); }
+      catch (e2) { showErr(card, "no roll: " + (e2 && e2.message ? e2.message : e2)); }
+    }
+    return Promise.resolve()
+      .then(function () { return probeBeaconRound(BEACON_URL, fetch); })
+      .then(function(round){
+        if (round === null) { fallback(); return null; }
+        pendingDie(tile, round);
+        return fetchBeacon(round).then(function(randomness){
+          if (!randomness) { fallback(); return null; }
+          return deriveDie(randomness, nonce, 0, die.min, die.max)
+            .then(function(value){
+              if (value === null) { fallback(); return; }
+              renderDieResult(tile, value);
+              showDieProof(tile, {
+                round: round, nonce: nonce, item: value, draw: 0,
+                dice: [{ min: rendered.min, max: rendered.max }]
+              });
+            });
+        });
+      })
+      .catch(rescue)
+      .then(function(){ setDiceBusy(card, false); return true; });
+  }
+
+  function bindDieReroll(card, tile){
+    if (tile._diceRerollBound) return;
+    tile._diceRerollBound = true;
+    var btn = tile.querySelector(".dice-reroll");
+    if (!btn) return;
+    btn.addEventListener("click", function(){ rerollDie(card, tile); });
+  }
+
+  function addDie(card, die){
+    var min = diceBound(die && die.min);
+    var max = diceBound(die && die.max);
+    if (min === null || max === null) {
+      showErr(card, "enter a finite minimum and maximum");
+      return null;
+    }
+    if (diceTiles(card).length >= 24) {
+      var full = card.querySelector(".dice-cap");
+      if (full) full.textContent = "tray holds 24 dice; this one was not added.";
+      showErr(card, "");
+      return null;
+    }
+    var tray = card.querySelector(".dice-tray");
+    if (!tray) return null;
+    var wrap = document.createElement("div");
+    wrap.innerHTML = diceTileMarkup({ min: min, max: max });
+    var tile = wrap.firstChild;
+    tray.appendChild(tile);
+    bindDieReroll(card, tile);
+    var cap = card.querySelector(".dice-cap");
+    if (cap) cap.textContent = "";
+    showErr(card, "");
+    var rollAll = card.querySelector(".dice-roll-all");
+    if (rollAll && !card._diceBusy) rollAll.disabled = false;
+    syncDiceUrl(card);
+    return tile;
+  }
+
+  function bindDice(card){
+    var tiles = diceTiles(card);
+    for (var i = 0; i < tiles.length; i++) bindDieReroll(card, tiles[i]);
+
+    var rollAll = card.querySelector(".dice-roll-all");
+    if (rollAll) rollAll.addEventListener("click", function(){ rollDiceAll(card); });
+
+    var presets = card.querySelectorAll(".dice-preset");
+    for (var k = 0; k < presets.length; k++) {
+      (function(btn){
+        btn.addEventListener("click", function(){
+          if (card._diceBusy) return;
+          addDie(card, { min: btn.getAttribute("data-min"), max: btn.getAttribute("data-max") });
+        });
+      })(presets[k]);
+    }
+
+    var add = card.querySelector(".dice-add");
+    var minIn = card.querySelector(".dice-custom-min");
+    var maxIn = card.querySelector(".dice-custom-max");
+    if (add && minIn && maxIn) {
+      add.addEventListener("click", function(){
+        if (card._diceBusy) return;
+        var min = diceBound(minIn.value);
+        var max = diceBound(maxIn.value);
+        if (min === null || max === null) {
+          showErr(card, "enter a finite minimum and maximum");
+          return;
+        }
+        minIn.value = min;
+        maxIn.value = max;
+        addDie(card, { min: min, max: max });
+      });
+    }
+    setDiceBusy(card, false);
+  }
+
   /* The card a result renders into is not always the card that owns the
      counter: the meta chooser shows its pick in its own card, but the press
      belongs to whichever chooser it landed on. Address the counter by slug. */
@@ -1840,6 +2484,8 @@ const CLIENT_SCRIPT = `
 
   var cards = document.querySelectorAll(".card[data-slug]");
   for (var i = 0; i < cards.length; i++) bindCard(cards[i]);
+  var diceCard = document.querySelector('.card[data-type="dice"]');
+  if (diceCard) bindDice(diceCard);
 
   /* create form ----------------------------------------------------- */
   var form = document.getElementById("create-form");
@@ -1988,6 +2634,7 @@ function page(opts) {
   <footer>
     <a href="/api/choosers">json</a>
     <a href="/verify">verify</a>
+    <a href="/dice/">dice</a>
     <span>random.oddspark.dev</span>
     <span>built-ins run in your browser; the rest are one press each</span>
     <a class="built" href="https://hearn.systems" rel="noopener">built by ${HEARN_MARK}</a>
@@ -2028,7 +2675,7 @@ const VERIFY_SCRIPT = `
   var TYPES = __VERIFY_TYPES__;
   var PALETTE = __SHAPE_COLORS__;
   var BEACON_URL = "https://drand.cloudflare.com/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971/public/";
-  var FIELDS = ["slug", "round", "nonce", "item", "via", "min", "max"];
+  var FIELDS = ["slug", "round", "nonce", "item", "via", "min", "max", "draw"];
 
   function el(id){ return document.getElementById("v-" + id); }
   function say(msg, cls){
@@ -2042,6 +2689,37 @@ const VERIFY_SCRIPT = `
   for (var i = 0; i < FIELDS.length; i++) {
     var val = q.get(FIELDS[i]);
     if (val !== null) el(FIELDS[i]).value = val;
+  }
+  var queryDice = q.getAll("d");
+  if (queryDice.length) {
+    el("dice").value = queryDice.join(", ");
+    // Preserve exact repeated query components for the initial auto-run;
+    // the visible comma-separated field is only an editing convenience.
+    el("dice")._queryDice = queryDice;
+    el("dice")._queryValue = el("dice").value;
+  }
+
+  function verifyBound(raw){
+    var n = parseFloat(raw);
+    if (!isFinite(n)) return null;
+    n = Math.round(n);
+    if (n > 1e12) n = 1e12;
+    if (n < -1e12) n = -1e12;
+    return n;
+  }
+
+  // Mirrors server dieFromParam: a leading hyphen is a sign; the first
+  // later hyphen separates an explicit, deliberately unswapped range.
+  function verifyDie(raw){
+    var value = String(raw).trim();
+    var separator = value.indexOf("-", 1);
+    if (separator === -1) {
+      var max = verifyBound(value);
+      return max === null ? null : { min: 1, max: max };
+    }
+    var min = verifyBound(value.slice(0, separator));
+    var max2 = verifyBound(value.slice(separator + 1));
+    return min === null || max2 === null ? null : { min: min, max: max2 };
   }
 
   function sleepVerify(ms){
@@ -2066,6 +2744,7 @@ const VERIFY_SCRIPT = `
   }
 
   function run(){
+    document.getElementById("drand-link").innerHTML = "";
     var slug = el("slug").value.trim().toLowerCase();
     var round = parseInt(el("round").value, 10);
     var nonce = el("nonce").value.trim();
@@ -2075,12 +2754,16 @@ const VERIFY_SCRIPT = `
       say("slug, round, nonce and item are required.", "err");
       return;
     }
-    var type = TYPES[slug] || "list";
+    var hasDiceShape = slug === "dice" &&
+      (el("dice").value.trim() !== "" || el("draw").value.trim() !== "");
+    var type = hasDiceShape ? "dice" : (TYPES[slug] || "list");
     if (type === "meta") {
       say("a random random pick verifies through the chooser it landed on; use the link from its badge.", "err");
       return;
     }
     var desc = { type: type };
+    var diceTarget = null;
+    var diceDraw = null;
     // A meta pick spent draw 0 choosing the chooser, so its item
     // draws start at 1. Direct picks start at 0.
     var base = via ? 1 : 0;
@@ -2100,7 +2783,54 @@ const VERIFY_SCRIPT = `
         return;
       }
     }
-    document.getElementById("drand-link").innerHTML = "";
+    if (type === "dice") {
+      if (via) {
+        say("via does not apply to dice.", "err");
+        return;
+      }
+      var diceField = el("dice");
+      var rawDice = diceField._queryDice && diceField.value === diceField._queryValue
+        ? diceField._queryDice.slice()
+        : diceField.value.split(",");
+      if (!diceField.value.trim() || !rawDice.length) {
+        say("a dice tray is required.", "err");
+        return;
+      }
+      if (rawDice.length > 24) {
+        say("a dice proof can contain at most 24 dice.", "err");
+        return;
+      }
+      var dice = [];
+      for (var d = 0; d < rawDice.length; d++) {
+        var parsed = verifyDie(rawDice[d]);
+        if (!parsed) {
+          say("every die must be a finite number or min-max range.", "err");
+          return;
+        }
+        dice.push(parsed);
+      }
+      var drawRaw = el("draw").value.trim();
+      diceDraw = Number(drawRaw);
+      if (!drawRaw || !isFinite(diceDraw) || Math.floor(diceDraw) !== diceDraw ||
+          diceDraw < 0 || diceDraw >= dice.length) {
+        say("draw must be a whole-number tray index.", "err");
+        return;
+      }
+      var target = dice[diceDraw];
+      diceTarget = target.min <= target.max
+        ? { min: target.min, max: target.max }
+        : { min: target.max, max: target.min };
+      if (diceTarget.max - diceTarget.min + 1 > 4294967296) {
+        say("the target die is too wide to verify.", "err");
+        return;
+      }
+      var diceItem = Number(item);
+      if (!isFinite(diceItem) || Math.floor(diceItem) !== diceItem ||
+          diceItem < diceTarget.min || diceItem > diceTarget.max) {
+        say("the claimed dice item must be a whole number within the target die.", "err");
+        return;
+      }
+    }
     say("fetching beacon round " + round + "…");
     fetchRound(round)
       .then(function(j){
@@ -2116,7 +2846,14 @@ const VERIFY_SCRIPT = `
             });
         }
         return Promise.resolve(ready)
-          .then(function(){ return deriveItem(desc, PALETTE, randomness, nonce, slug, base); })
+          .then(function(){
+            if (type === "dice") {
+              return deriveDie(
+                randomness, nonce, diceDraw, diceTarget.min, diceTarget.max
+              ).then(function(value){ return value === null ? null : String(value); });
+            }
+            return deriveItem(desc, PALETTE, randomness, nonce, slug, base);
+          })
           .then(function(computed){
             if (computed == null) { say("could not recompute a pick from those inputs.", "err"); return; }
             document.getElementById("drand-link").innerHTML =
@@ -2186,6 +2923,9 @@ function verifyPage() {
     daily back then, including on the changeover day, so a pick from that
     era may not recompute either. That is an honest mismatch, not proof of
     rigging.</p>
+    <p>Dice links also carry the complete ordered tray and the target draw
+    index. The verifier keeps each die&rsquo;s displayed bound order as evidence,
+    then orders only the target bounds for derivation.</p>
     <form id="verify-form">
       <div class="row">
         <label>chooser slug <input id="v-slug" autocomplete="off" placeholder="number"></label>
@@ -2197,6 +2937,10 @@ function verifyPage() {
         <label>via (optional) <input id="v-via" autocomplete="off" placeholder="random"></label>
         <label>min (number only) <input id="v-min" inputmode="numeric" autocomplete="off" placeholder="1"></label>
         <label>max (number only) <input id="v-max" inputmode="numeric" autocomplete="off" placeholder="100"></label>
+      </div>
+      <div class="row">
+        <label>draw (dice only) <input id="v-draw" inputmode="numeric" autocomplete="off" placeholder="0"></label>
+        <label>dice tray (comma-separated d values) <input id="v-dice" autocomplete="off" placeholder="6, 20, 9-3"></label>
       </div>
       <button class="strike" type="submit">Verify</button>
     </form>
@@ -2493,6 +3237,39 @@ export default {
 
       if (path === "/verify") {
         return html(verifyPage(), 200, { "cache-control": "no-store" });
+      }
+
+      /* Dice tray --------------------------------------------------- */
+
+      if (path === "/dice") {
+        const rawDice = url.searchParams.getAll("d");
+        const validDice =
+          rawDice.length === 0
+            ? [{ min: 1, max: 6 }]
+            : rawDice.map(dieFromParam).filter((die) => die !== null);
+        const capped = validDice.length > 24;
+        const dice = Object.freeze(
+          validDice.slice(0, 24).map((die) => Object.freeze({ min: die.min, max: die.max }))
+        );
+        if (request.method === "GET" && wantsText(request)) {
+          const body = url.searchParams.has("roll")
+            ? await rollDiceText(dice, capped, origin)
+            : renderDiceText(dice, capped, origin, null);
+          return text(body, 200, { "cache-control": "no-store" });
+        }
+        return html(
+          page({
+            title: "dice tray / random choosers",
+            desc: "Roll a shareable tray of dice from one verifiable randomness beacon commit.",
+            canonical: "https://random.oddspark.dev/dice/",
+            cards: diceCardHtml(dice, capped),
+            choosers: [],
+            showCreate: false,
+            sitekey: env.TURNSTILE_SITE_KEY || "",
+          }),
+          200,
+          { "cache-control": "no-store" }
+        );
       }
 
       /* Permalink ------------------------------------------------- */
