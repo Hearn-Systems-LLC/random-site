@@ -760,12 +760,28 @@ const B = (s) => BUILTINS.find((b) => b.slug === s);
 const post = (s) => worker.fetch(req("/api/pick/" + s, { method: "POST" }), env, ctx);
 
 // builtinPick is pure, so hammer it for range invariants rather than exact
-// values. Bounds are where an off-by-one hides.
+// values. Then pin both inclusive bounds with deterministic crypto words;
+// waiting for random sampling to hit both endpoints makes CI flaky.
 const nums = Array.from({ length: 400 }, () => Number(builtinPick(B("number"))));
 check("number is always an integer", nums.every((n) => Number.isInteger(n)));
 check("number never below 1", Math.min(...nums) >= 1, Math.min(...nums));
 check("number never above 100", Math.max(...nums) <= 100, Math.max(...nums));
-check("number reaches both bounds over 400 draws", nums.includes(1) && nums.includes(100));
+const numberRandom = crypto.getRandomValues;
+let numberLow;
+let numberHigh;
+try {
+  crypto.getRandomValues = (buf) => { buf[0] = 0; return buf; };
+  numberLow = Number(builtinPick(B("number")));
+  crypto.getRandomValues = (buf) => { buf[0] = 99; return buf; };
+  numberHigh = Number(builtinPick(B("number")));
+} finally {
+  crypto.getRandomValues = numberRandom;
+}
+check(
+  "number includes both bounds",
+  numberLow === 1 && numberHigh === 100,
+  numberLow + " / " + numberHigh
+);
 
 const cols = Array.from({ length: 200 }, () => builtinPick(B("color")));
 check("color is a 6-digit lowercase hex", cols.every((c) => /^#[0-9a-f]{6}$/.test(c)), cols[0]);
