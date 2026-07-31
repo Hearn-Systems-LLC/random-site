@@ -102,6 +102,24 @@ words can't draw from), the press falls back to a local
 `crypto.getRandomValues` pick, badged **unverified**, and API responses carry
 `proof: null`. A broken beacon never breaks a card.
 
+### Dice from a terminal
+
+`/dice/` uses the same repeated `d` grammar for browsers and terminals. A curl
+request renders the normalized tray without rolling it and prints a ready-to-run
+command:
+
+```sh
+curl 'https://random.oddspark.dev/dice/?d=6&d=9-3'
+curl 'https://random.oddspark.dev/dice/?d=6&d=9-3&roll'
+```
+
+The presence of `roll` makes a text GET roll the whole capped tray under one
+round and nonce. Verified results include absolute `/verify` links; overflow or
+beacon-fallback results are marked `unverified`. With no `d`, the tray defaults
+to d6. If supplied `d` values are all invalid, the text tray is empty and emits
+no roll command. HTML requests keep the interactive browser roller and ignore
+`roll`.
+
 ## User-created choosers
 
 The last card on the homepage is a creation form: a name (max 60 chars), a
@@ -159,7 +177,7 @@ in the `Counters` Durable Object.
 |---|---|
 | `GET /` | HTML card grid (built-ins, then KV choosers with counts from one DO `/counts` call, create card last). curl/wget/no-`text/html` gets a `text/plain` rendering |
 | `GET /c/:slug` | permalink for one chooser (built-ins too); unknown slug → 404 page, not a redirect. Honors the text sniffing |
-| `GET /dice` | HTML dice tray configured by repeated `?d=` params (`d=6`, `d=3-17`); supports one-commit roll-all and per-die re-rolls, with the address bar as the share mechanism |
+| `GET /dice` | Dice tray configured by repeated `?d=` params (`d=6`, `d=3-17`); HTML supports interactive roll-all/re-roll, while curl or another text GET prints the tray and rolls server-side when `roll` is present |
 | `GET /verify` | recomputation page: prefilled from `?slug=&round=&nonce=&item=` (plus chooser options `&via=`, `&min=&max=`, or dice proof `&draw=` and repeated `&d=`); fetches the round from drand in the visitor's browser and reports match/mismatch |
 | `POST /api/pick/:slug` | `{slug, name, item, count, proof}`; `proof` is `{round, nonce}` for beacon-derived picks, `null` on fallback. 404 JSON for unknown slugs |
 | `GET /api/items/:slug` | `{slug, items}` — the list a `/verify` recomputation draws from; 404 for unknown slugs and non-list built-ins |

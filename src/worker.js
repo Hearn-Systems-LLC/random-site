@@ -1026,6 +1026,122 @@ function dieLabel(die) {
   return die.min + "\u2013" + die.max;
 }
 
+function dieParamValue(die) {
+  return die.min === 1 ? String(die.max) : String(die.min) + "-" + String(die.max);
+}
+
+function orderedDie(die) {
+  return die.min <= die.max
+    ? { min: die.min, max: die.max }
+    : { min: die.max, max: die.min };
+}
+
+// Uniform local integer over every accepted dice span. Six random bytes are
+// enough for the full +/-1e12 range and stay exactly representable by Number.
+function localDieValue(die) {
+  if (die.max <= die.min) return die.min;
+  const span = die.max - die.min + 1;
+  const sampleSize = 281474976710656; // 2^48
+  const limit = Math.floor(sampleSize / span) * span;
+  const bytes = new Uint8Array(6);
+  let sample;
+  do {
+    crypto.getRandomValues(bytes);
+    sample = 0;
+    for (let i = 0; i < bytes.length; i++) sample = sample * 256 + bytes[i];
+  } while (sample >= limit);
+  return die.min + (sample % span);
+}
+
+function diceTrayUrl(origin, dice, roll) {
+  const target = new URL("/dice/", origin);
+  for (const die of dice) target.searchParams.append("d", dieParamValue(die));
+  return target.toString() + (roll ? (target.search ? "&roll" : "?roll") : "");
+}
+
+function diceVerifyUrl(origin, dice, result, draw) {
+  const target = new URL("/verify", origin);
+  target.searchParams.set("slug", "dice");
+  target.searchParams.set("round", String(result.round));
+  target.searchParams.set("nonce", result.nonce);
+  target.searchParams.set("item", String(result.item));
+  target.searchParams.set("draw", String(draw));
+  for (const die of dice) target.searchParams.append("d", dieParamValue(die));
+  return target.toString();
+}
+
+function renderDiceText(dice, capped, origin, results) {
+  const lines = ["dice tray"];
+  if (!dice.length) {
+    lines.push("(empty)");
+    return lines.join("\n") + "\n";
+  }
+  for (let i = 0; i < dice.length; i++) {
+    const result = results && results[i];
+    lines.push("[" + i + "] " + dieLabel(dice[i]) + (result ? " = " + result.item : ""));
+    if (result) {
+      if (result.verified) {
+        lines.push("    verified \u00b7 round " + result.round);
+        lines.push("    " + diceVerifyUrl(origin, dice, result, i));
+      } else {
+        lines.push("    unverified");
+      }
+    }
+  }
+  if (capped) lines.push("tray holds 24 dice; extras were left out.");
+  if (!results) lines.push("roll: curl '" + diceTrayUrl(origin, dice, true) + "'");
+  return lines.join("\n") + "\n";
+}
+
+async function rollDiceText(dice, capped, origin) {
+  const results = new Array(dice.length);
+  const eligible = [];
+  for (let i = 0; i < dice.length; i++) {
+    const die = orderedDie(dice[i]);
+    if (die.max - die.min + 1 > 4294967296) {
+      results[i] = { item: localDieValue(die), verified: false };
+    } else {
+      eligible.push({ die, index: i });
+    }
+  }
+
+  if (eligible.length) {
+    let nonce;
+    try {
+      nonce = bytesToHex(crypto.getRandomValues(new Uint8Array(8)));
+      const round = await probeBeaconRound(BEACON_URL, fetch);
+      if (!Number.isInteger(round) || round <= 0) throw new Error("beacon unavailable");
+      const randomness = await awaitBeaconRound(round, fetch);
+      if (!randomness) throw new Error("beacon unavailable");
+      const values = await Promise.all(
+        eligible.map((entry) =>
+          deriveDie(randomness, nonce, entry.index, entry.die.min, entry.die.max)
+        )
+      );
+      if (values.some((value, i) =>
+        !Number.isInteger(value) ||
+        value < eligible[i].die.min || value > eligible[i].die.max
+      )) {
+        throw new Error("dice derivation failed");
+      }
+      for (let i = 0; i < eligible.length; i++) {
+        results[eligible[i].index] = {
+          item: values[i],
+          verified: true,
+          round,
+          nonce,
+        };
+      }
+    } catch (e) {
+      for (const entry of eligible) {
+        results[entry.index] = { item: localDieValue(entry.die), verified: false };
+      }
+    }
+  }
+
+  return renderDiceText(dice, capped, origin, results);
+}
+
 function dieTileHtml(die) {
   const label = dieLabel(die);
   return (
@@ -3132,7 +3248,15 @@ export default {
             ? [{ min: 1, max: 6 }]
             : rawDice.map(dieFromParam).filter((die) => die !== null);
         const capped = validDice.length > 24;
-        const dice = validDice.slice(0, 24);
+        const dice = Object.freeze(
+          validDice.slice(0, 24).map((die) => Object.freeze({ min: die.min, max: die.max }))
+        );
+        if (request.method === "GET" && wantsText(request)) {
+          const body = url.searchParams.has("roll")
+            ? await rollDiceText(dice, capped, origin)
+            : renderDiceText(dice, capped, origin, null);
+          return text(body, 200, { "cache-control": "no-store" });
+        }
         return html(
           page({
             title: "dice tray / random choosers",

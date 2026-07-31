@@ -760,12 +760,28 @@ const B = (s) => BUILTINS.find((b) => b.slug === s);
 const post = (s) => worker.fetch(req("/api/pick/" + s, { method: "POST" }), env, ctx);
 
 // builtinPick is pure, so hammer it for range invariants rather than exact
-// values. Bounds are where an off-by-one hides.
+// values. Then pin both inclusive bounds with deterministic crypto words;
+// waiting for random sampling to hit both endpoints makes CI flaky.
 const nums = Array.from({ length: 400 }, () => Number(builtinPick(B("number"))));
 check("number is always an integer", nums.every((n) => Number.isInteger(n)));
 check("number never below 1", Math.min(...nums) >= 1, Math.min(...nums));
 check("number never above 100", Math.max(...nums) <= 100, Math.max(...nums));
-check("number reaches both bounds over 400 draws", nums.includes(1) && nums.includes(100));
+const numberRandom = crypto.getRandomValues;
+let numberLow;
+let numberHigh;
+try {
+  crypto.getRandomValues = (buf) => { buf[0] = 0; return buf; };
+  numberLow = Number(builtinPick(B("number")));
+  crypto.getRandomValues = (buf) => { buf[0] = 99; return buf; };
+  numberHigh = Number(builtinPick(B("number")));
+} finally {
+  crypto.getRandomValues = numberRandom;
+}
+check(
+  "number includes both bounds",
+  numberLow === 1 && numberHigh === 100,
+  numberLow + " / " + numberHigh
+);
 
 const cols = Array.from({ length: 200 }, () => builtinPick(B("color")));
 check("color is a 6-digit lowercase hex", cols.every((c) => /^#[0-9a-f]{6}$/.test(c)), cols[0]);
@@ -1852,6 +1868,415 @@ check(
     !/<div class="proof"[^>]*aria-live=/.test(diceMarkup(dicePage.body))
 );
 
+/* 36b. curl dice tray and server roll ----------------------------------- */
+const DICE_CURL_HEADERS = { "user-agent": "curl/8.4.0", accept: "*/*" };
+const SERVER_DICE_RANDOMNESS = "ab".repeat(32);
+
+function serverDiceBeacon(latest, { publish = true } = {}) {
+  const calls = [];
+  const roundCalls = new Map();
+  return {
+    calls,
+    latestCount() {
+      return calls.filter((raw) => new URL(raw).pathname.endsWith("/latest")).length;
+    },
+    roundCount(round) {
+      return roundCalls.get(round) || 0;
+    },
+    async fetch(raw) {
+      const value = String(raw);
+      if (!value.startsWith(BEACON_PREFIX)) throw new Error("unexpected dice fetch: " + value);
+      calls.push(value);
+      const part = value.slice(BEACON_PREFIX.length).split("?")[0];
+      if (part === "latest") return Response.json({ round: latest });
+      const round = Number(part);
+      const count = (roundCalls.get(round) || 0) + 1;
+      roundCalls.set(round, count);
+      if (round <= latest + 2) {
+        return Response.json({ round, randomness: SERVER_DICE_RANDOMNESS });
+      }
+      if (round === latest + 3 && count > 1 && publish) {
+        return Response.json({ round, randomness: SERVER_DICE_RANDOMNESS });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  };
+}
+
+function fixedDiceRandom(callWidths, { nonceByte = 0x11, localBytes } = {}) {
+  let localCall = 0;
+  return function (array) {
+    callWidths.push(array.byteLength);
+    if (array.byteLength === 8) {
+      array.fill(nonceByte);
+    } else if (array.byteLength === 6) {
+      const byte = localBytes ? localBytes[localCall++] : 0;
+      array.fill(byte === undefined ? 0 : byte);
+    } else {
+      throw new Error("unexpected crypto width: " + array.byteLength);
+    }
+    return array;
+  };
+}
+
+async function withServerDiceGlobals({ fetchImpl, randomImpl, digestImpl }, run) {
+  const previousFetch = globalThis.fetch;
+  const previousRandom = crypto.getRandomValues;
+  const previousDigest = crypto.subtle.digest;
+  globalThis.fetch = fetchImpl;
+  if (randomImpl) crypto.getRandomValues = randomImpl;
+  if (digestImpl) crypto.subtle.digest = digestImpl;
+  try {
+    return await run();
+  } finally {
+    globalThis.fetch = previousFetch;
+    crypto.getRandomValues = previousRandom;
+    crypto.subtle.digest = previousDigest;
+  }
+}
+
+async function serverDiceResponse(url, init = {}) {
+  const request = new Request(url, {
+    ...init,
+    headers: { ...DICE_CURL_HEADERS, ...(init.headers || {}) },
+  });
+  const response = await worker.fetch(request, env, ctx);
+  return { response, body: await response.text() };
+}
+
+function serverDiceItems(body) {
+  const items = [];
+  const re = /^\[(\d+)\] .+ = (-?\d+)$/gm;
+  let match;
+  while ((match = re.exec(body))) items[Number(match[1])] = Number(match[2]);
+  return items;
+}
+
+function serverDiceProofs(body) {
+  return body.split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^https?:\/\/[^/]+\/verify\?/.test(line))
+    .map((line) => new URL(line));
+}
+
+let quietFetches = 0;
+const quietRandomWidths = [];
+const trayOnly = await withServerDiceGlobals(
+  {
+    fetchImpl() { quietFetches++; throw new Error("descriptive dice fetched"); },
+    randomImpl: fixedDiceRandom(quietRandomWidths),
+  },
+  () => serverDiceResponse(
+    "https://dice.example:8443/dice/?d=6abc&d=9-3&raw=%3Cscript%3E"
+  )
+);
+check(
+  "curl dice tray is stable text with a canonical shell-quoted roll command",
+  trayOnly.response.status === 200 &&
+    trayOnly.response.headers.get("content-type") === "text/plain; charset=utf-8" &&
+    trayOnly.response.headers.get("cache-control") === "no-store" &&
+    trayOnly.body ===
+      "dice tray\n[0] d6\n[1] 9\u20133\n" +
+      "roll: curl 'https://dice.example:8443/dice/?d=6&d=9-3&roll'\n",
+  trayOnly.body
+);
+check(
+  "descriptive curl dice does no beacon or random work and echoes no raw query",
+  quietFetches === 0 && quietRandomWidths.length === 0 &&
+    !trayOnly.body.includes("raw") && !trayOnly.body.includes("script") &&
+    !trayOnly.body.includes("6abc"),
+  "fetches " + quietFetches + ", random widths " + quietRandomWidths.join(",")
+);
+
+quietFetches = 0;
+quietRandomWidths.length = 0;
+const defaultTray = await withServerDiceGlobals(
+  {
+    fetchImpl() { quietFetches++; throw new Error("default tray fetched"); },
+    randomImpl: fixedDiceRandom(quietRandomWidths),
+  },
+  () => serverDiceResponse(
+    "https://dice.example/dice/",
+    { headers: { "user-agent": "browser", accept: "text/plain" } }
+  )
+);
+const emptyRoll = await withServerDiceGlobals(
+  {
+    fetchImpl() { quietFetches++; throw new Error("empty tray fetched"); },
+    randomImpl: fixedDiceRandom(quietRandomWidths),
+  },
+  () => serverDiceResponse("https://dice.example/dice/?d=invalid&roll")
+);
+check(
+  "curl dice distinguishes the default d6 from an all-invalid empty tray",
+  defaultTray.body ===
+      "dice tray\n[0] d6\nroll: curl 'https://dice.example/dice/?d=6&roll'\n" &&
+    emptyRoll.body === "dice tray\n(empty)\n" &&
+    quietFetches === 0 && quietRandomWidths.length === 0,
+  defaultTray.body + " / " + emptyRoll.body
+);
+
+const verifiedBeacon = serverDiceBeacon(960000);
+const verifiedRandomWidths = [];
+const verifiedRoll = await withServerDiceGlobals(
+  {
+    fetchImpl: verifiedBeacon.fetch.bind(verifiedBeacon),
+    randomImpl: fixedDiceRandom(verifiedRandomWidths, { nonceByte: 0x11 }),
+  },
+  () => serverDiceResponse(
+    "https://dice.example:8443/dice/?d=6&d=9-3&roll=0&roll=again&junk=secret"
+  )
+);
+const verifiedItems = serverDiceItems(verifiedRoll.body);
+const verifiedProofs = serverDiceProofs(verifiedRoll.body);
+const verifiedNonce = "11".repeat(8);
+const verifiedExpected = await Promise.all([
+  deriveDie(SERVER_DICE_RANDOMNESS, verifiedNonce, 0, 1, 6),
+  deriveDie(SERVER_DICE_RANDOMNESS, verifiedNonce, 1, 3, 9),
+]);
+check(
+  "curl dice roll presence makes one shared commit and exact indexed derivations",
+  verifiedRoll.response.status === 200 &&
+    verifiedRoll.response.headers.get("content-type") === "text/plain; charset=utf-8" &&
+    verifiedRoll.response.headers.get("cache-control") === "no-store" &&
+    verifiedRoll.body.endsWith("\n") &&
+    verifiedBeacon.latestCount() === 1 &&
+    verifiedRandomWidths.filter((n) => n === 8).length === 1 &&
+    JSON.stringify(verifiedItems) === JSON.stringify(verifiedExpected),
+  verifiedRoll.body
+);
+check(
+  "curl dice verified links use request origin, one provenance, and only replay fields",
+  verifiedProofs.length === 2 && verifiedProofs.every((proof, i) =>
+    proof.origin === "https://dice.example:8443" &&
+    proof.pathname === "/verify" &&
+    proof.searchParams.get("slug") === "dice" &&
+    proof.searchParams.get("round") === "960003" &&
+    proof.searchParams.get("nonce") === verifiedNonce &&
+    Number(proof.searchParams.get("item")) === verifiedExpected[i] &&
+    proof.searchParams.get("draw") === String(i) &&
+    JSON.stringify(proof.searchParams.getAll("d")) === JSON.stringify(["6", "9-3"]) &&
+    JSON.stringify([...new Set(proof.searchParams.keys())].sort()) ===
+      JSON.stringify(["d", "draw", "item", "nonce", "round", "slug"]) &&
+    !proof.search.includes("junk") && !proof.search.includes("roll")
+  ),
+  verifiedProofs.map(String).join(" | ")
+);
+const emittedReplay = await bootVerifyPage(
+  verifiedProofs[1].search,
+  mkVerifyFetch([], { randomness: SERVER_DICE_RANDOMNESS })
+);
+check(
+  "curl dice emitted proof auto-replays through the shipped verifier",
+  emittedReplay.verdict.className.includes("ok") &&
+    emittedReplay.doc.getElementById("v-draw").value === "1" &&
+    emittedReplay.doc.getElementById("v-dice").value === "6, 9-3",
+  emittedReplay.verdict.textContent
+);
+
+const mixedBeacon = serverDiceBeacon(970000);
+const mixedServerRandomWidths = [];
+const mixedServerRoll = await withServerDiceGlobals(
+  {
+    fetchImpl: mixedBeacon.fetch.bind(mixedBeacon),
+    randomImpl: fixedDiceRandom(mixedServerRandomWidths, { nonceByte: 0x22 }),
+  },
+  () => serverDiceResponse("https://dice.example/dice/?d=5000000000&d=6&roll")
+);
+const mixedServerItems = serverDiceItems(mixedServerRoll.body);
+const mixedServerProofs = serverDiceProofs(mixedServerRoll.body);
+const mixedServerExpected = await deriveDie(
+  SERVER_DICE_RANDOMNESS, "22".repeat(8), 1, 1, 6
+);
+check(
+  "curl dice mixed overflow stays local while its peer keeps original draw index",
+  mixedServerItems[0] === 1 && mixedServerItems[1] === mixedServerExpected &&
+    (mixedServerRoll.body.match(/^    unverified$/gm) || []).length === 1 &&
+    mixedServerProofs.length === 1 && mixedServerProofs[0].searchParams.get("draw") === "1" &&
+    JSON.stringify(mixedServerProofs[0].searchParams.getAll("d")) ===
+      JSON.stringify(["5000000000", "6"]) &&
+    mixedBeacon.latestCount() === 1 &&
+    JSON.stringify(mixedServerRandomWidths) === JSON.stringify([6, 8]),
+  mixedServerRoll.body
+);
+
+const thresholdBeacon = serverDiceBeacon(975000);
+const thresholdRandomWidths = [];
+const thresholdRoll = await withServerDiceGlobals(
+  {
+    fetchImpl: thresholdBeacon.fetch.bind(thresholdBeacon),
+    randomImpl: fixedDiceRandom(thresholdRandomWidths, { nonceByte: 0x23 }),
+  },
+  () => serverDiceResponse(
+    "https://dice.example/dice/?d=4294967296&d=4294967297&roll"
+  )
+);
+const thresholdProofs = serverDiceProofs(thresholdRoll.body);
+check(
+  "curl dice keeps a 2^32 span verifiable and overflows at 2^32 + 1",
+  thresholdProofs.length === 1 &&
+    thresholdProofs[0].searchParams.get("draw") === "0" &&
+    thresholdProofs[0].searchParams.get("d") === "4294967296" &&
+    (thresholdRoll.body.match(/^    unverified$/gm) || []).length === 1 &&
+    thresholdBeacon.latestCount() === 1 &&
+    JSON.stringify(thresholdRandomWidths) === JSON.stringify([6, 8]),
+  thresholdRoll.body
+);
+
+let overflowFetches = 0;
+const overflowRandomWidths = [];
+const allOverflow = await withServerDiceGlobals(
+  {
+    fetchImpl() { overflowFetches++; throw new Error("overflow tray fetched"); },
+    randomImpl: fixedDiceRandom(overflowRandomWidths, {
+      localBytes: [0xff, 0, 0xff, 0],
+    }),
+  },
+  () => serverDiceResponse(
+    "https://dice.example/dice/?d=5000000000&d=-1000000000000-1000000000000&roll"
+  )
+);
+const overflowItems = serverDiceItems(allOverflow.body);
+check(
+  "curl dice all-overflow roll is bounded, rejection-sampled, and beacon-free",
+  overflowFetches === 0 &&
+    overflowRandomWidths.filter((n) => n === 8).length === 0 &&
+    JSON.stringify(overflowRandomWidths) === JSON.stringify([6, 6, 6, 6]) &&
+    overflowItems[0] === 1 && overflowItems[1] === -1000000000000 &&
+    serverDiceProofs(allOverflow.body).length === 0 &&
+    (allOverflow.body.match(/^    unverified$/gm) || []).length === 2,
+  allOverflow.body + " / " + overflowRandomWidths.join(",")
+);
+
+const syncProbeWidths = [];
+let syncProbeCalls = 0;
+const syncProbeFailure = await withServerDiceGlobals(
+  {
+    fetchImpl() { syncProbeCalls++; throw new Error("sync probe failure"); },
+    randomImpl: fixedDiceRandom(syncProbeWidths, { nonceByte: 0x33 }),
+  },
+  () => serverDiceResponse("https://dice.example/dice/?d=6&d=20&roll")
+);
+check(
+  "curl dice synchronous probe failure atomically falls back every eligible die",
+  syncProbeFailure.response.status === 200 && syncProbeCalls === 1 &&
+    serverDiceProofs(syncProbeFailure.body).length === 0 &&
+    (syncProbeFailure.body.match(/^    unverified$/gm) || []).length === 2 &&
+    JSON.stringify(syncProbeWidths) === JSON.stringify([8, 6, 6]),
+  syncProbeFailure.body
+);
+
+const previousBeaconCap = beaconTiming.capMs;
+beaconTiming.capMs = -1;
+const waitFailureBeacon = serverDiceBeacon(980000, { publish: false });
+const waitFailureWidths = [];
+const waitFailure = await withServerDiceGlobals(
+  {
+    fetchImpl: waitFailureBeacon.fetch.bind(waitFailureBeacon),
+    randomImpl: fixedDiceRandom(waitFailureWidths, { nonceByte: 0x44 }),
+  },
+  () => serverDiceResponse("https://dice.example/dice/?d=6&d=20&roll")
+);
+beaconTiming.capMs = previousBeaconCap;
+check(
+  "curl dice wait failure atomically falls back without a second commit",
+  waitFailure.response.status === 200 && waitFailureBeacon.latestCount() === 1 &&
+    waitFailureBeacon.roundCount(980003) === 2 &&
+    serverDiceProofs(waitFailure.body).length === 0 &&
+    (waitFailure.body.match(/^    unverified$/gm) || []).length === 2,
+  waitFailure.body
+);
+
+const deriveFailureBeacon = serverDiceBeacon(990000);
+const deriveFailureWidths = [];
+let digestCalls = 0;
+const zeroDigest = new Uint8Array(32).buffer;
+const deriveFailure = await withServerDiceGlobals(
+  {
+    fetchImpl: deriveFailureBeacon.fetch.bind(deriveFailureBeacon),
+    randomImpl: fixedDiceRandom(deriveFailureWidths, { nonceByte: 0x55 }),
+    digestImpl() {
+      digestCalls++;
+      return digestCalls === 2
+        ? Promise.reject(new Error("one die derivation rejected"))
+        : Promise.resolve(zeroDigest.slice(0));
+    },
+  },
+  () => serverDiceResponse("https://dice.example/dice/?d=6&d=20&roll")
+);
+check(
+  "curl dice one rejected derivation prevents a partial verified result",
+  deriveFailure.response.status === 200 && deriveFailureBeacon.latestCount() === 1 &&
+    digestCalls === 2 && serverDiceProofs(deriveFailure.body).length === 0 &&
+    (deriveFailure.body.match(/^    unverified$/gm) || []).length === 2 &&
+    JSON.stringify(deriveFailureWidths) === JSON.stringify([8, 6, 6]),
+  deriveFailure.body
+);
+
+const capQuery = Array.from({ length: 24 }, () => "d=6").concat("d=999").join("&");
+const capBeacon = serverDiceBeacon(995000);
+const capRandomWidths = [];
+const cappedServerRoll = await withServerDiceGlobals(
+  {
+    fetchImpl: capBeacon.fetch.bind(capBeacon),
+    randomImpl: fixedDiceRandom(capRandomWidths, { nonceByte: 0x66 }),
+  },
+  () => serverDiceResponse("https://dice.example/dice/?" + capQuery + "&roll")
+);
+const cappedProofs = serverDiceProofs(cappedServerRoll.body);
+check(
+  "curl dice cap rolls and proves exactly the first 24 normalized dice",
+  cappedProofs.length === 24 && capBeacon.latestCount() === 1 &&
+    capRandomWidths.filter((n) => n === 8).length === 1 &&
+    cappedServerRoll.body.includes("tray holds 24 dice; extras were left out.") &&
+    !cappedServerRoll.body.includes("d999") &&
+    cappedProofs.every((proof, i) =>
+      proof.searchParams.get("draw") === String(i) &&
+      proof.searchParams.getAll("d").length === 24 &&
+      proof.searchParams.getAll("d").every((value) => value === "6")
+    ),
+  "proofs " + cappedProofs.length + ", latest " + capBeacon.latestCount()
+);
+
+let ignoredFetches = 0;
+const ignoredRandomWidths = [];
+const ignoredModes = await withServerDiceGlobals(
+  {
+    fetchImpl() { ignoredFetches++; throw new Error("non-text dice fetched"); },
+    randomImpl: fixedDiceRandom(ignoredRandomWidths),
+  },
+  async () => {
+    const htmlPlain = await serverDiceResponse(
+      "https://dice.example/dice/?d=6",
+      { headers: { accept: "text/html", "user-agent": "browser" } }
+    );
+    const htmlRoll = await serverDiceResponse(
+      "https://dice.example/dice/?d=6&roll",
+      { headers: { accept: "text/html", "user-agent": "browser" } }
+    );
+    const headRoll = await serverDiceResponse(
+      "https://dice.example/dice/?d=6&roll",
+      { method: "HEAD" }
+    );
+    const postRoll = await serverDiceResponse(
+      "https://dice.example/dice/?d=6&roll",
+      { method: "POST" }
+    );
+    return { htmlPlain, htmlRoll, headRoll, postRoll };
+  }
+);
+check(
+  "HTML, HEAD, and non-GET dice requests ignore roll and keep route behavior",
+  ignoredModes.htmlPlain.body === ignoredModes.htmlRoll.body &&
+    ignoredModes.htmlRoll.response.headers.get("content-type").includes("text/html") &&
+    ignoredModes.headRoll.response.status === 200 &&
+    ignoredModes.headRoll.response.headers.get("content-type").includes("text/html") &&
+    ignoredModes.postRoll.response.status === 200 &&
+    ignoredModes.postRoll.response.headers.get("content-type").includes("text/html") &&
+    ignoredFetches === 0 && ignoredRandomWidths.length === 0,
+  "fetches " + ignoredFetches + ", random widths " + ignoredRandomWidths.join(",")
+);
+
 /* 37. server/client dice agreement --------------------------------------- */
 // Run the parser shipped in CLIENT_SCRIPT, not a test rewrite. Every bound
 // rendered by the server must survive the client acceptance core unchanged;
@@ -1922,6 +2347,14 @@ check(
 );
 const workerExports = await import("./src/worker.js");
 check("dice URL parser stays module-private", !("dieFromParam" in workerExports));
+check(
+  "curl dice helpers stay module-private",
+  ![
+    "dieParamValue", "orderedDie", "localDieValue", "diceTrayUrl", "diceVerifyUrl",
+    "renderDiceText", "rollDiceText",
+  ]
+    .some((name) => name in workerExports)
+);
 check(
   "deriveDie uses the dice slug and requested draw index",
   (await deriveDie(V_RAND, V_NONCE, 2, 3, 17)) ===
