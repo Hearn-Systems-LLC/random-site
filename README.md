@@ -8,9 +8,8 @@ Cloudflare Worker, no build step. Same conventions as
 Every pick is **verifiable**: it commits to a [drand](https://drand.love)
 quicknet round this gateway path has not published yet plus a one-press
 nonce, waits for publication (typically ~0–3s), and derives the result
-deterministically. Chooser-card badges link to `/verify`, where anyone can
-recompute the pick; dice currently show round-and-nonce provenance while their
-verification UI is deferred. Details below.
+deterministically. Chooser-card and dice badges link to `/verify`, where anyone
+can recompute the pick. Details below.
 
 ## Built-in choosers
 
@@ -90,10 +89,13 @@ round from drand in the visitor's own browser and recomputes the item;
 visitor-made lists never change, so their picks recompute forever, against
 the same list. API responses carry the same `proof: {round, nonce}`.
 
-Dice use the same beacon commit and derivation primitive, but dice replay is
-not yet wired into `/verify`: their badges currently show `round N · nonce X`
-as provenance text (or `unverified` on fallback), without a verification claim
-or link.
+Dice badges use `/verify?slug=dice&round=&nonce=&item=&draw=` plus one repeated
+`&d=` for every rendered die in tray order. A roll-all badge preserves the
+complete unswapped tray, including any locally-falling-back overflow die, and
+targets that die's original tray index. A per-die re-roll is the same contract
+with one `d` and `draw=0`. The verifier parses the repeated dice exactly like
+`/dice`, orders only the selected die's bounds, and calls the byte-identical
+`deriveDie`; it never requests `/api/items/dice`.
 
 If the beacon is unreachable (or a number span exceeds 2³², which 32-bit hash
 words can't draw from), the press falls back to a local
@@ -158,7 +160,7 @@ in the `Counters` Durable Object.
 | `GET /` | HTML card grid (built-ins, then KV choosers with counts from one DO `/counts` call, create card last). curl/wget/no-`text/html` gets a `text/plain` rendering |
 | `GET /c/:slug` | permalink for one chooser (built-ins too); unknown slug → 404 page, not a redirect. Honors the text sniffing |
 | `GET /dice` | HTML dice tray configured by repeated `?d=` params (`d=6`, `d=3-17`); supports one-commit roll-all and per-die re-rolls, with the address bar as the share mechanism |
-| `GET /verify` | recomputation page: prefilled from `?slug=&round=&nonce=&item=` (plus optional `&via=`, `&min=&max=`); fetches the round from drand in the visitor's browser and reports match/mismatch |
+| `GET /verify` | recomputation page: prefilled from `?slug=&round=&nonce=&item=` (plus chooser options `&via=`, `&min=&max=`, or dice proof `&draw=` and repeated `&d=`); fetches the round from drand in the visitor's browser and reports match/mismatch |
 | `POST /api/pick/:slug` | `{slug, name, item, count, proof}`; `proof` is `{round, nonce}` for beacon-derived picks, `null` on fallback. 404 JSON for unknown slugs |
 | `GET /api/items/:slug` | `{slug, items}` — the list a `/verify` recomputation draws from; 404 for unknown slugs and non-list built-ins |
 | `POST /api/create` | `{slug, name}` or a JSON error (400 / 403 / 429 / 502) |
@@ -205,4 +207,4 @@ call), permalinks, the curl text path, `/api/choosers`, the
 beacon round math, derivation vectors and uniformity, client/server
 derivation equivalence via the shipped script, proof fields on every
 `/api/pick` shape, beacon-down fallback, the poll loop, and the `/verify`
-page.
+page, including badge-to-verifier dice replay.
