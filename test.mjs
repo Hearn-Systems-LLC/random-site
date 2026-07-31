@@ -1438,6 +1438,124 @@ check(
   JSON.parse(kv.get("c:legacy-birds")).listDay === "2026-01-01"
 );
 
+/* 34. pre-filled number bounds on the permalink ------------------------- */
+// GET /c/number?min=X&max=Y renders the chooser's bounds inputs pre-filled
+// server-side. The acceptance set mirrors the client clamped(): parseFloat
+// -> isFinite -> Math.round -> clamp +/-1e12. One check per I/O matrix row.
+async function cBody(path, init) {
+  const r = await worker.fetch(req(path, init || { headers: { accept: "text/html" } }), env, ctx);
+  return { status: r.status, body: await r.text() };
+}
+function numValues(body) {
+  const min = body.match(/class="num-min" value="([^"]*)"/);
+  const max = body.match(/class="num-max" value="([^"]*)"/);
+  return { min: min && min[1], max: max && max[1] };
+}
+const boundRows = [
+  ["HAPPY_PATH", "?min=5&max=8", "5", "8"],
+  ["NO_PARAMS", "", "1", "100"],
+  ["PARTIAL", "?max=7", "1", "7"],
+  ["NON_NUMERIC", "?min=abc&max=", "1", "100"],
+  ["FRACTIONAL", "?min=5.7&max=8.2", "6", "8"],
+  ["EXPONENT", "?min=1e3", "1000", "100"],
+  ["TRAILING_JUNK", "?min=5abc", "5", "100"],
+  ["NON_FINITE", "?min=Infinity&max=NaN", "1", "100"],
+  ["OUT_OF_CAP", "?min=-5e12&max=5e12", "-1000000000000", "1000000000000"],
+  ["MIN_OVER_CAP", "?min=5e12", "1000000000000", "100"],
+  ["MAX_UNDER_CAP", "?max=-5e12", "1", "-1000000000000"],
+  ["CAP_EXACT", "?min=1e12&max=-1e12", "1000000000000", "-1000000000000"],
+  ["CAP_ROUND_EDGE", "?min=1000000000000.6", "1000000000000", "100"],
+  ["NEGATIVE", "?min=-9&max=-2", "-9", "-2"],
+  ["DEGENERATE", "?min=4&max=4", "4", "4"],
+  ["SWAPPED", "?min=9&max=3", "9", "3"],
+  ["DUPLICATE_PARAM", "?min=5&min=7", "5", "100"],
+];
+for (const [rowName, query, expMin, expMax] of boundRows) {
+  const { status, body } = await cBody("/c/number" + query);
+  const v = numValues(body);
+  check(
+    "bounds " + rowName + " renders " + expMin + " / " + expMax,
+    status === 200 && v.min === expMin && v.max === expMax,
+    "status " + status + ", got " + v.min + " / " + v.max
+  );
+}
+
+// MARKUP_INJECTION, two checks: percent-encoded and raw. The URL layer
+// normalizes the raw form to the encoded one before searchParams sees it,
+// so both must converge on the defaults. Asserted as full-body equality
+// against the no-params baseline under a fixed cookie fixture -- strictly
+// stronger than scanning for any particular payload string, and matching
+// the spec's "no injected markup anywhere in the body".
+const boundsCookie = await freshCookie();
+const fixedInit = { headers: { accept: "text/html", cookie: "rc_uid=" + boundsCookie } };
+const injBaseline = await cBody("/c/number", fixedInit);
+for (const [form, query] of [["percent-encoded", "?min=%3Cscript%3E"], ["raw", "?min=<script>"]]) {
+  const { status, body } = await cBody("/c/number" + query, fixedInit);
+  check(
+    "bounds MARKUP_INJECTION (" + form + ") renders defaults, no injected markup",
+    status === 200 && body === injBaseline.body,
+    "status " + status + ", body length " + body.length + " vs baseline " + injBaseline.body.length
+  );
+}
+
+// OTHER_TYPE and USER_CHOOSER: params ignored, body identical to the same
+// request without params, under the same fixed cookie fixture.
+const colorPlain = await cBody("/c/color", fixedInit);
+const colorParams = await cBody("/c/color?min=5&max=8", fixedInit);
+check(
+  "bounds OTHER_TYPE (/c/color) ignores min/max",
+  colorParams.status === 200 && colorParams.body === colorPlain.body,
+  "body lengths " + colorParams.body.length + " vs " + colorPlain.body.length
+);
+const userPlain = await cBody("/c/random-dinosaur", fixedInit);
+const userParams = await cBody("/c/random-dinosaur?min=5&max=8", fixedInit);
+check(
+  "bounds USER_CHOOSER ignores min/max",
+  userParams.status === 200 && userParams.body === userPlain.body,
+  "body lengths " + userParams.body.length + " vs " + userPlain.body.length
+);
+
+/* 35. server/client bounds agreement ------------------------------------ */
+// The load-bearing invariant, locked by execution rather than prose: any
+// value the server renders into a bounds input passes through the shipped
+// client numberBounds unchanged whenever min <= max (clamped() must not
+// rewrite it). The other input is pinned to the far cap so the documented
+// swap path never fires here; the swap itself is locked separately below.
+const CAP_STR = "1000000000000";
+for (const query of boundRows.map((r) => r[1]).concat(["?min=%3Cscript%3E", "?min=<script>"])) {
+  const { status, body } = await cBody("/c/number" + query);
+  const v = numValues(body);
+  const minIn = { value: v.min };
+  const minCard = { querySelector: (sel) => (sel === ".num-min" ? minIn : sel === ".num-max" ? { value: CAP_STR } : null) };
+  const nbMin = rtA.numberBounds(minCard);
+  const maxIn = { value: v.max };
+  const maxCard = { querySelector: (sel) => (sel === ".num-max" ? maxIn : sel === ".num-min" ? { value: "-" + CAP_STR } : null) };
+  const nbMax = rtA.numberBounds(maxCard);
+  check(
+    "agreement [" + (query || "no params") + "]: client keeps " + v.min + " / " + v.max,
+    status === 200 && nbMin.a === Number(v.min) && minIn.value === Number(v.min) && nbMax.b === Number(v.max) && maxIn.value === Number(v.max),
+    "status " + status + ", client returned " + nbMin.a + " / " + nbMax.b + " for rendered " + v.min + " / " + v.max
+  );
+}
+
+// The per-input agreement above can never exercise the swap; lock the
+// documented SWAPPED behavior end to end: the rendered 9 / 3 pair goes
+// through numberBounds together and comes back 3 / 9 with both inputs
+// rewritten -- exactly what the spec says a press must do.
+{
+  const { body } = await cBody("/c/number?min=9&max=3");
+  const v = numValues(body);
+  const swapMin = { value: v.min };
+  const swapMax = { value: v.max };
+  const swapCard = { querySelector: (sel) => (sel === ".num-min" ? swapMin : sel === ".num-max" ? swapMax : null) };
+  const nb = rtA.numberBounds(swapCard);
+  check(
+    "agreement SWAPPED pair: press swaps 9 / 3 to 3 / 9 and rewrites both inputs",
+    nb.a === 3 && nb.b === 9 && swapMin.value === 3 && swapMax.value === 9,
+    "client returned " + nb.a + " / " + nb.b + ", inputs now " + swapMin.value + " / " + swapMax.value
+  );
+}
+
 /* report -------------------------------------------------------------- */
 let fails = 0;
 for (const r of results) {

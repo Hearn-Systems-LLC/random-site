@@ -972,14 +972,31 @@ function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
-function cardHtml(c, count) {
+// Server mirror of the client clamped() numeric core (numberBounds in
+// CLIENT_SCRIPT): parseFloat -> reject non-finite -> Math.round -> clamp
+// to +/-1e12. The two acceptance sets must stay identical, or the client
+// would silently rewrite a server-rendered bound on press; test.mjs locks
+// the agreement by execution. A null raw (param absent) yields NaN, which
+// is not finite, so the fallback covers both missing and invalid params.
+function boundFromParam(raw, fallback) {
+  const n = parseFloat(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(1e12, Math.max(-1e12, Math.round(n)));
+}
+
+function cardHtml(c, count, bounds) {
   const perm = ' <a class="perm" href="/c/' + esc(c.slug) + '" title="permalink">&para;</a>';
   let controls = "";
   if (c.type === "number") {
+    // bounds arrives pre-sanitized from the /c/ route; cardHtml does no
+    // parsing of its own, and a bounds arg reaching a non-number chooser
+    // is simply unused.
+    const numMin = bounds && bounds.min !== undefined ? bounds.min : 1;
+    const numMax = bounds && bounds.max !== undefined ? bounds.max : 100;
     controls =
       '<div class="ctl">' +
-      '<label>min <input type="number" class="num-min" value="1" step="1"></label>' +
-      '<label>max <input type="number" class="num-max" value="100" step="1"></label>' +
+      '<label>min <input type="number" class="num-min" value="' + esc(numMin) + '" step="1"></label>' +
+      '<label>max <input type="number" class="num-max" value="' + esc(numMax) + '" step="1"></label>' +
       "</div>";
   } else if (c.type === "meta") {
     // The per-chooser list is filled in by the client from the inlined
@@ -2490,6 +2507,15 @@ export default {
         }
         if (wantsText(request)) return text(chooserAsText(rec, origin));
         const counts = builtin ? {} : await fetchCounts(env, [slug]);
+        // Only the number chooser honors ?min=/?max= pre-fill; every other
+        // type gets no bounds arg and ignores the params entirely.
+        const bounds =
+          rec.type === "number"
+            ? {
+                min: boundFromParam(url.searchParams.get("min"), 1),
+                max: boundFromParam(url.searchParams.get("max"), 100),
+              }
+            : undefined;
         // Only the meta chooser needs the whole shelf; every other
         // permalink stays at its current single-lookup cost.
         const choosers =
@@ -2502,7 +2528,7 @@ export default {
             title: rec.name + " / random choosers",
             desc: "Press the button; get a random " + rec.name + ".",
             canonical: "https://random.oddspark.dev/c/" + rec.slug,
-            cards: cardHtml(rec, counts[slug]),
+            cards: cardHtml(rec, counts[slug], bounds),
             choosers,
             showCreate: false,
             sitekey: env.TURNSTILE_SITE_KEY || "",
