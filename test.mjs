@@ -2333,6 +2333,17 @@ check(
   )
 );
 check(
+  "dice server and shipped client tiles expose an accessible Remove control",
+  diceTileMarkups(tileAgreement.body).every((markup) =>
+    /<button class="dice-remove dice-roll-control" type="button" aria-label="Remove [^"]+">Remove<\/button><\/div>$/.test(markup)
+  ) &&
+    tileAgreementBounds.every(([min, max]) =>
+      diceParseRt.diceTileMarkup({ min, max }).includes(
+        '<button class="dice-remove dice-roll-control" type="button" aria-label="Remove '
+      )
+    )
+);
+check(
   "dice shorthand labels use range form when max is not above min",
   diceParseRt.diceLabel({ min: 1, max: 0 }) === "1–0" &&
     diceParseRt.diceLabel({ min: 1, max: -3 }) === "1–-3" &&
@@ -2387,7 +2398,9 @@ function fakeDiceButton(attrs = {}) {
   const handlers = {};
   return {
     disabled: false,
+    focused: false,
     getAttribute: (name) => attrs[name] === undefined ? null : String(attrs[name]),
+    focus() { this.focused = true; },
     addEventListener(type, fn) {
       if (!handlers[type]) handlers[type] = [];
       handlers[type].push(fn);
@@ -2408,15 +2421,21 @@ function fakeDiceTile(min, max) {
   const caption = trackedDiceNode(label);
   const proof = trackedDiceNode("");
   const reroll = fakeDiceButton();
+  const removeButton = fakeDiceButton();
   const attrs = { "data-min": String(min), "data-max": String(max) };
   return {
-    face, caption, proof, reroll,
+    face, caption, proof, reroll, removeButton,
+    parentNode: null,
+    remove() {
+      if (this.parentNode) this.parentNode.removeChild(this);
+    },
     getAttribute: (name) => attrs[name] === undefined ? null : attrs[name],
     querySelector: (sel) =>
       sel === ".die-face" ? face :
       sel === ".die-label" ? caption :
       sel === ".proof" ? proof :
-      sel === ".dice-reroll" ? reroll : null,
+      sel === ".dice-reroll" ? reroll :
+      sel === ".dice-remove" ? removeButton : null,
   };
 }
 
@@ -2434,12 +2453,30 @@ function fakeDiceCard(bounds = [], opts = {}) {
     err: { hidden: true, textContent: "" },
     _diceBusy: false,
   };
-  card.tray = { appendChild: (tile) => { card.tiles.push(tile); return tile; } };
+  card.tray = {
+    appendChild(tile) {
+      tile.parentNode = card.tray;
+      card.tiles.push(tile);
+      return tile;
+    },
+    removeChild(tile) {
+      const index = card.tiles.indexOf(tile);
+      if (index !== -1) card.tiles.splice(index, 1);
+      tile.parentNode = null;
+      return tile;
+    },
+  };
+  for (const tile of card.tiles) tile.parentNode = card.tray;
   card.querySelectorAll = (sel) => {
     if (sel === ".die[data-min][data-max]") return card.tiles.slice();
     if (sel === ".dice-roll-control,.dice-preset,.dice-add") {
       return [card.rollAll]
-        .concat(card.tiles.map((tile) => tile.reroll), card.presets, [card.addButton]);
+        .concat(
+          card.tiles.map((tile) => tile.reroll),
+          card.tiles.map((tile) => tile.removeButton),
+          card.presets,
+          [card.addButton]
+        );
     }
     if (sel === ".dice-custom input") return [card.minInput, card.maxInput];
     if (sel === ".dice-preset") return card.presets;
@@ -3004,6 +3041,7 @@ check(
 /* 39. client tray mutation and address-bar sync -------------------------- */
 function fakeDiceDocument() {
   return {
+    activeElement: null,
     createElement() {
       let firstChild = null;
       const wrap = {};
@@ -3024,19 +3062,33 @@ function fakeDiceDocument() {
 const DICE_ADD_FNS = [
   "diceBound", "dieFromElement", "diceTiles", "diceLabel", "diceParam",
   "diceTileMarkup", "syncDiceUrl", "setDiceBusy", "bindDieReroll",
-  "addDie", "bindDice",
+  "removeDie", "addDie", "bindDice",
 ];
 function diceAddRuntime(href, replacements) {
   const calls = [];
-  const windowStub = { location: { href } };
+  const navigations = [];
+  let currentHref = href;
+  const locationStub = {};
+  Object.defineProperty(locationStub, "href", {
+    get: () => currentHref,
+    set(next) {
+      navigations.push(next);
+      currentHref = new URL(next, currentHref).href;
+    },
+  });
+  const windowStub = { location: locationStub };
   const historyStub = {
-    replaceState(state, title, next) { calls.push(next); },
+    replaceState(state, title, next) {
+      calls.push(next);
+      currentHref = new URL(next, currentHref).href;
+    },
   };
+  const documentStub = fakeDiceDocument();
   const rt = clientRuntime(eqScript, DICE_ADD_FNS, {
     esc: (s) => String(s).replace(/[&<>"]/g, (c) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])
     ),
-    document: fakeDiceDocument(),
+    document: documentStub,
     window: windowStub,
     history: historyStub,
     URL,
@@ -3048,7 +3100,7 @@ function diceAddRuntime(href, replacements) {
     rollDiceAll: () => Promise.resolve(true),
     ...(replacements || {}),
   });
-  return { rt, calls, windowStub };
+  return { rt, calls, windowStub, documentStub, navigations };
 }
 
 const addEnv = diceAddRuntime("https://random.oddspark.dev/dice/?x=1&d=9-3");
@@ -3079,8 +3131,145 @@ check(
     addCard.tiles[2].getAttribute("data-min") === "3" &&
     addCard.tiles[2].getAttribute("data-max") === "17" &&
     addEnv.calls[1] === "/dice/?x=1&d=9-3&d=6&d=3-17" &&
-    addEnv.windowStub.location.href === "https://random.oddspark.dev/dice/?x=1&d=9-3",
+    addEnv.windowStub.location.href ===
+      "https://random.oddspark.dev/dice/?x=1&d=9-3&d=6&d=3-17" &&
+    addEnv.navigations.length === 0,
   addEnv.calls.join(" | ")
+);
+const addedCustomTile = addCard.tiles[2];
+addedCustomTile.removeButton.click();
+check(
+  "dice client-added tiles bind their Remove control",
+  addCard.tiles.length === 2 &&
+    !addCard.tiles.includes(addedCustomTile) &&
+    addEnv.calls[2] === "/dice/?x=1&d=9-3&d=6"
+);
+
+const removeEnv = diceAddRuntime(
+  "https://random.oddspark.dev/dice/?x=1&d=6&d=6&d=20#receipt"
+);
+const removeCard = fakeDiceCard([[1, 6], [1, 6], [1, 20]]);
+removeEnv.rt.bindDice(removeCard);
+const firstDuplicate = removeCard.tiles[0];
+const removedDuplicate = removeCard.tiles[1];
+const lastSurvivor = removeCard.tiles[2];
+heldRt.renderDieResult(firstDuplicate, 4);
+heldRt.showDieProof(firstDuplicate, {
+  round: 777, nonce: "1111111111111111", item: 4, draw: 0,
+  dice: [{ min: 1, max: 6 }, { min: 1, max: 6 }, { min: 1, max: 20 }],
+});
+heldRt.renderDieResult(lastSurvivor, 17);
+heldRt.showDieProof(lastSurvivor, {
+  round: 777, nonce: "2222222222222222", item: 17, draw: 2,
+  dice: [{ min: 1, max: 6 }, { min: 1, max: 6 }, { min: 1, max: 20 }],
+});
+const firstFace = firstDuplicate.face;
+const lastFace = lastSurvivor.face;
+const firstProof = firstDuplicate.proof;
+const lastProof = lastSurvivor.proof;
+const firstFaceState = [firstFace.className, firstFace.innerHTML, firstFace.textContent];
+const lastFaceState = [lastFace.className, lastFace.innerHTML, lastFace.textContent];
+const firstProofMarkup = firstProof.innerHTML;
+const lastProofMarkup = lastProof.innerHTML;
+const firstProofLink = diceProofHref(firstDuplicate);
+const lastProofLink = diceProofHref(lastSurvivor);
+removeCard.cap.textContent = "tray holds 24 dice; extras were left out.";
+removeEnv.documentStub.activeElement = removedDuplicate.removeButton;
+removedDuplicate.removeButton.click();
+check(
+  "dice Remove targets the exact duplicate identity and syncs ordered d params once without navigation",
+  removeCard.tiles.length === 2 &&
+    removeCard.tiles[0] === firstDuplicate &&
+    removeCard.tiles[1] === lastSurvivor &&
+    !removeCard.tiles.includes(removedDuplicate) &&
+    removeEnv.calls.length === 1 &&
+    removeEnv.calls[0] === "/dice/?x=1&d=6&d=20#receipt" &&
+    removeEnv.windowStub.location.href ===
+      "https://random.oddspark.dev/dice/?x=1&d=6&d=20#receipt" &&
+    removeEnv.navigations.length === 0 &&
+    lastSurvivor.removeButton.focused &&
+    removeCard.cap.textContent === "",
+  removeEnv.calls.join(" | ")
+);
+check(
+  "dice Remove preserves surviving result and proof nodes, markup, and original proof hrefs",
+  firstDuplicate.face === firstFace &&
+    lastSurvivor.face === lastFace &&
+    firstDuplicate.proof === firstProof &&
+    lastSurvivor.proof === lastProof &&
+    JSON.stringify([firstFace.className, firstFace.innerHTML, firstFace.textContent]) ===
+      JSON.stringify(firstFaceState) &&
+    JSON.stringify([lastFace.className, lastFace.innerHTML, lastFace.textContent]) ===
+      JSON.stringify(lastFaceState) &&
+    firstProof.innerHTML === firstProofMarkup &&
+    lastProof.innerHTML === lastProofMarkup &&
+    diceProofHref(firstDuplicate) === firstProofLink &&
+    diceProofHref(lastSurvivor) === lastProofLink &&
+    new URL(firstProofLink, "https://random.oddspark.dev").searchParams.getAll("d").join(",") ===
+      "6,6,20" &&
+    new URL(lastProofLink, "https://random.oddspark.dev").searchParams.get("draw") === "2"
+);
+
+const emptyRemoveEnv = diceAddRuntime(
+  "https://random.oddspark.dev/dice/?x=1&d=6#empty"
+);
+const emptyRemoveCard = fakeDiceCard([[1, 6]]);
+emptyRemoveEnv.rt.bindDice(emptyRemoveCard);
+emptyRemoveEnv.documentStub.activeElement = emptyRemoveCard.tiles[0].removeButton;
+emptyRemoveCard.tiles[0].removeButton.click();
+const emptyNextUrl = new URL(emptyRemoveEnv.calls[0], "https://random.oddspark.dev");
+check(
+  "dice removing the final tile writes one empty d sentinel and disables only Roll all",
+  emptyRemoveCard.tiles.length === 0 &&
+    emptyRemoveEnv.calls.length === 1 &&
+    emptyRemoveEnv.calls[0] === "/dice/?x=1&d=#empty" &&
+    emptyNextUrl.searchParams.getAll("d").length === 1 &&
+    emptyNextUrl.searchParams.get("d") === "" &&
+    emptyRemoveEnv.windowStub.location.href ===
+      "https://random.oddspark.dev/dice/?x=1&d=#empty" &&
+    emptyRemoveEnv.navigations.length === 0 &&
+    emptyRemoveCard.rollAll.disabled &&
+    !emptyRemoveCard.addButton.disabled &&
+    emptyRemoveCard.presets.every((button) => !button.disabled) &&
+    !emptyRemoveCard.minInput.disabled &&
+    !emptyRemoveCard.maxInput.disabled &&
+    emptyRemoveCard.addButton.focused,
+  emptyRemoveEnv.calls.join(" | ")
+);
+const emptyRoundTrip = await cBody(emptyRemoveEnv.calls[0]);
+const bareRoundTrip = await cBody("/dice/");
+check(
+  "dice generated empty-tray URL round-trips empty while bare /dice/ remains the default d6",
+  emptyRoundTrip.status === 200 &&
+    diceValues(emptyRoundTrip.body).length === 0 &&
+    diceRollAllDisabled(emptyRoundTrip.body) &&
+    bareRoundTrip.status === 200 &&
+    JSON.stringify(diceValues(bareRoundTrip.body)) === JSON.stringify([[1, 6]]) &&
+    !diceRollAllDisabled(bareRoundTrip.body)
+);
+
+const busyRemoveEnv = diceAddRuntime(
+  "https://random.oddspark.dev/dice/?d=6&d=20#busy"
+);
+const busyRemoveCard = fakeDiceCard([[1, 6], [1, 20]]);
+busyRemoveEnv.rt.bindDice(busyRemoveCard);
+busyRemoveCard.cap.textContent = "keep this notice";
+busyRemoveCard.tiles[0].proof.innerHTML = '<a href="/verify?kept=1">proof</a>';
+const busyTiles = busyRemoveCard.tiles.slice();
+busyRemoveEnv.rt.setDiceBusy(busyRemoveCard, true);
+busyRemoveCard.tiles[0].removeButton.click();
+const directBusyRemoval = busyRemoveEnv.rt.removeDie(busyRemoveCard, busyRemoveCard.tiles[0]);
+check(
+  "dice busy lock disables every Remove control and direct removal is a no-op",
+  busyRemoveCard._diceBusy &&
+    busyRemoveCard.tiles.every((tile) => tile.removeButton.disabled) &&
+    directBusyRemoval === false &&
+    busyRemoveCard.tiles.length === 2 &&
+    busyRemoveCard.tiles[0] === busyTiles[0] &&
+    busyRemoveCard.tiles[1] === busyTiles[1] &&
+    busyRemoveCard.tiles[0].proof.innerHTML === '<a href="/verify?kept=1">proof</a>' &&
+    busyRemoveCard.cap.textContent === "keep this notice" &&
+    busyRemoveEnv.calls.length === 0
 );
 
 const canonicalEnv = diceAddRuntime("https://random.oddspark.dev/dice/?d=1-6");
