@@ -1150,6 +1150,7 @@ function dieTileHtml(die) {
     '<div class="die-label" aria-hidden="true">' + esc(label) + "</div>" +
     '<div class="proof"></div>' +
     '<button class="dice-reroll dice-roll-control" type="button" aria-label="Re-roll ' + esc(label) + '">Re-roll</button>' +
+    '<button class="dice-remove dice-roll-control" type="button" aria-label="Remove ' + esc(label) + '">Remove</button>' +
     "</div>"
   );
 }
@@ -1362,15 +1363,15 @@ const CSS = `
 
   .dice-back{align-self:flex-start; font-size:11px; color:var(--faint)}
   .dice-presets{display:flex; flex-wrap:wrap; gap:7px}
-  .dice-presets button,.dice-add,.dice-reroll{
+  .dice-presets button,.dice-add,.dice-reroll,.dice-remove{
     background:var(--void); border:1px solid var(--rule); color:var(--text);
     font-family:var(--mono); font-size:11px; padding:7px 10px; cursor:pointer;
   }
-  .dice-presets button:hover:not(:disabled),.dice-add:hover:not(:disabled),.dice-reroll:hover:not(:disabled){
+  .dice-presets button:hover:not(:disabled),.dice-add:hover:not(:disabled),.dice-reroll:hover:not(:disabled),.dice-remove:hover:not(:disabled){
     border-color:var(--entropy); color:#E4EAF0;
   }
-  .dice-presets button:disabled,.dice-add:disabled,.dice-reroll:disabled{opacity:.45; cursor:wait}
-  .dice-presets button:focus-visible,.dice-add:focus-visible,.dice-reroll:focus-visible{
+  .dice-presets button:disabled,.dice-add:disabled,.dice-reroll:disabled,.dice-remove:disabled{opacity:.45; cursor:wait}
+  .dice-presets button:focus-visible,.dice-add:focus-visible,.dice-reroll:focus-visible,.dice-remove:focus-visible{
     outline:2px solid var(--entropy); outline-offset:2px;
   }
   .dice-custom{display:flex; flex-wrap:wrap; align-items:end; gap:10px}
@@ -1410,7 +1411,7 @@ const CSS = `
   .pip-7{grid-area:3/1}.pip-8{grid-area:3/2}.pip-9{grid-area:3/3}
   .die-label{font-size:10px; color:var(--dim); letter-spacing:.08em; word-break:break-word; text-align:center}
   .die .proof{width:100%; min-height:34px; text-align:center; letter-spacing:.06em; text-transform:none}
-  .dice-reroll{width:100%}
+  .dice-reroll,.dice-remove{width:100%}
   .dice-cap{min-height:18px; color:var(--dim); font-size:11px}
 
   .ctl-pool{flex-wrap:wrap}
@@ -1935,7 +1936,9 @@ const CLIENT_SCRIPT = `
       '<div class="die-label" aria-hidden="true">' + esc(label) + "</div>" +
       '<div class="proof"></div>' +
       '<button class="dice-reroll dice-roll-control" type="button" aria-label="Re-roll ' +
-      esc(label) + '">Re-roll</button></div>';
+      esc(label) + '">Re-roll</button>' +
+      '<button class="dice-remove dice-roll-control" type="button" aria-label="Remove ' +
+      esc(label) + '">Remove</button></div>';
   }
 
   function syncDiceUrl(card){
@@ -1946,6 +1949,7 @@ const CLIENT_SCRIPT = `
       var die = dieFromElement(tiles[i]);
       if (die) url.searchParams.append("d", diceParam(die));
     }
+    if (!tiles.length) url.searchParams.append("d", "");
     history.replaceState(null, "", url.pathname + url.search + url.hash);
   }
 
@@ -2201,8 +2205,34 @@ const CLIENT_SCRIPT = `
     if (tile._diceRerollBound) return;
     tile._diceRerollBound = true;
     var btn = tile.querySelector(".dice-reroll");
-    if (!btn) return;
-    btn.addEventListener("click", function(){ rerollDie(card, tile); });
+    if (btn) btn.addEventListener("click", function(){ rerollDie(card, tile); });
+    var remove = tile.querySelector(".dice-remove");
+    if (remove) remove.addEventListener("click", function(){ removeDie(card, tile); });
+  }
+
+  function removeDie(card, tile){
+    if (card._diceBusy) return false;
+    var tiles = diceTiles(card);
+    var found = -1;
+    for (var i = 0; i < tiles.length; i++) {
+      if (tiles[i] === tile) { found = i; break; }
+    }
+    if (found < 0) return false;
+    var remove = tile.querySelector(".dice-remove");
+    var restoreFocus = document.activeElement === remove;
+    var focusTile = tiles[found + 1] || tiles[found - 1] || null;
+    tile.remove();
+    var cap = card.querySelector(".dice-cap");
+    if (cap) cap.textContent = "";
+    syncDiceUrl(card);
+    setDiceBusy(card, false);
+    if (restoreFocus) {
+      var focusTarget = focusTile
+        ? focusTile.querySelector(".dice-remove")
+        : card.querySelector(".dice-add");
+      if (focusTarget && typeof focusTarget.focus === "function") focusTarget.focus();
+    }
+    return true;
   }
 
   function addDie(card, die){
